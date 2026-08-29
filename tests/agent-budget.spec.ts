@@ -8,7 +8,7 @@ describe('plugin surface and config', () => {
     const module = await import('../src/index.ts')
     expect({ name, inject, Config: typeof Config, apply: typeof apply }).toEqual({
       name: 'agent-budget',
-      inject: ['llm', 'sessions', 'tools', 'agents'],
+      inject: ['llm', 'sessions', 'tools', 'agents', 'webServer'],
       Config: 'function',
       apply: 'function',
     })

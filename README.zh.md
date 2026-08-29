@@ -15,7 +15,8 @@ Token 预算插件。根 Agent、one-shot/continuable subagent 以及 workflow �
   卸载插件不会破坏会话；
 - 账本仍是 append-only、可重放、可恢复；
 - 给模型本身提供只读的 `budget_status` 工具，而不只是人类命令；
-- **无 UI / 无外部服务**，可作为普通 bundle 安装；
+- 提供**设置页面板**：查看所有 scope、调整上限、重置用量，无需手改账本文件；
+- **无外部服务**，可作为普通 bundle 安装；
 - 保持范围狭窄：聚焦“Agent 树级、可持久化、可重放、fail-closed 的 Token 记账”。
 
 ## 安装
@@ -76,6 +77,20 @@ allowBuilds:
 
 模型可以调用只读工具 `budget_status`，查看上限、已用量、剩余量、耗尽状态、四类
 usage、`meteringComplete` 和 `unmeteredCalls`。工具不能修改预算。
+
+## 设置页与 HTTP API
+
+Web client 会在设置页注册 `Token 预算` 面板：列出所有已开启的预算 scope，
+展示 limit/used/remaining/exhausted 与进度条，每 30 秒轮询刷新。
+
+Host HTTP API 位于 `/agent-budget/api`：
+
+- `GET /scopes` → `{ ok, scopes: [{ scopeKey, limitTokens, usedTokens, ... }] }`
+- `POST /adjust-limit`，body `{ scopeKey, limitTokens }` → 覆盖该 scope 的上限
+- `POST /reset`，body `{ scopeKey }` → 清空用量但保留当前上限
+
+`adjust` 与 `reset` 都以新行追加进 sidecar 账本。旧的 `open`/`sample` 行不会
+被修改，因此重放账本得到的结果与增量更新一致。
 
 ## 行为
 

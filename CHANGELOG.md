@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-08-18
 
 ### Changed
 
@@ -25,6 +25,13 @@
 - `tests/migrate-session-log.spec.ts` covers multi-frame zstd migration, empty
   event-frame handling, ledger/index output, and backup creation.
 - README and design docs document the single-process `storageDir` limitation.
+- Settings page panel (`settings.section`) with scope list, limit adjustment,
+  and reset controls.
+- Host HTTP API under `/agent-budget/api`: `GET /scopes`,
+  `POST /adjust-limit`, and `POST /reset`.
+- Ledger `adjust` and `reset` event lines with append-only replay semantics.
+- `tests/budget-adjust.spec.ts` covers adjust/reset behavior, replay, and API
+  error codes.
 
 ## [0.1.0] - 2026-08-17
 

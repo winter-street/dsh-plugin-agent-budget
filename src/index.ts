@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -9,11 +10,22 @@ import z from '@deepseek-ai/schemastery'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
-import type { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    webServer: {
+      register(route: {
+        kind: 'prefix'
+        path: string
+        handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+      }): () => void
+    }
+  }
+}
+
 export const name = 'agent-budget'
-export const inject = ['llm', 'sessions', 'tools', 'agents']
+export const inject = ['llm', 'sessions', 'tools', 'agents', 'webServer']
 
 const EVENT_VERSION = 1 as const
 const EXHAUSTED_CODE = 'TOKEN_BUDGET_EXHAUSTED'
@@ -116,6 +128,17 @@ type LedgerLine =
     provider: string
     model: string
     purpose: BudgetSample['purpose']
+  }
+  | {
+    type: 'adjust'
+    version: typeof EVENT_VERSION
+    scopeKey: string
+    limitTokens: number
+  }
+  | {
+    type: 'reset'
+    version: typeof EVENT_VERSION
+    scopeKey: string
   }
 
 interface LedgerState {
@@ -299,6 +322,14 @@ function isLedgerLine(value: unknown): value is LedgerLine {
         || value.purpose === 'compaction'
         || value.purpose === 'session-title')
   }
+  if (value.type === 'adjust') {
+    return typeof value.limitTokens === 'number'
+      && Number.isSafeInteger(value.limitTokens)
+      && value.limitTokens > 0
+  }
+  if (value.type === 'reset') {
+    return true
+  }
   return false
 }
 
@@ -327,6 +358,16 @@ function foldLedgerLine(scopeKey: string, state: LedgerState, line: LedgerLine):
   }
   if (line.type === 'unmetered') {
     if (!state.samples.has(line.callId)) state.unmetered.add(line.callId)
+    return
+  }
+  if (line.type === 'adjust') {
+    ledgerOpen.limitTokens = line.limitTokens
+    return
+  }
+  if (line.type === 'reset') {
+    state.samples.clear()
+    state.unmetered.clear()
+    state.usage = { ...ZERO_USAGE }
   }
 }
 
@@ -443,6 +484,27 @@ class LedgerStore {
     appendLedgerLine(this.ledgerPath, line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
+
+  appendAdjust(scopeKey: string, limitTokens: number): void {
+    const line: LedgerLine = {
+      type: 'adjust',
+      version: EVENT_VERSION,
+      scopeKey,
+      limitTokens,
+    }
+    appendLedgerLine(this.ledgerPath, line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
+
+  appendReset(scopeKey: string): void {
+    const line: LedgerLine = {
+      type: 'reset',
+      version: EVENT_VERSION,
+      scopeKey,
+    }
+    appendLedgerLine(this.ledgerPath, line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
 }
 
 function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
@@ -453,7 +515,7 @@ function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
 }
 
 function runtimeRoot(ctx: Context, sessionId: string, cache: OwnershipCache): string | undefined {
-  const agents = ctx.get('agents') as AgentRegistry | undefined
+  const agents = ctx.get('agents')
   if (agents === undefined) return undefined
   const live = agents.list()
   if (live.length === 0) return undefined
@@ -588,6 +650,21 @@ function budgetStatus(
     meteringComplete: unmeteredCalls === 0,
     unmeteredCalls,
   }
+}
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+function sendJson(res: ServerResponse, code: number, body: unknown): void {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(body))
+}
+
+function scopesOf(store: LedgerStore): string[] {
+  return [...store.states.keys()].filter(scopeKey => store.state(scopeKey).open !== undefined)
 }
 
 /** Register the shared budget gate, sidecar ledger, and read-only status tool. */
@@ -760,4 +837,61 @@ export function apply(ctx: Context, config: Config): void {
     },
     presentCall: () => ({ card: 'generic', title: 'Token budget status', kind: 'other' }),
   }))
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/agent-budget/api',
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      try {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const path = url.pathname.replace(/^\/agent-budget\/api/, '') || '/'
+        if (req.method === 'GET' && path === '/scopes') {
+          const scopes: Array<Record<string, unknown>> = []
+          for (const scopeKey of scopesOf(store)) {
+            const entry: Record<string, unknown> = { scopeKey }
+            Object.assign(entry, budgetStatus(store, config, scopeKey, false, logger, missingUsage))
+            scopes.push(entry)
+          }
+          return sendJson(res, 200, { ok: true, scopes })
+        }
+        if (req.method === 'POST' && path === '/adjust-limit') {
+          const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey.trim() : ''
+          const limitTokens = typeof body.limitTokens === 'number' ? body.limitTokens : Number.NaN
+          if (scopeKey.length === 0 || !Number.isSafeInteger(limitTokens) || limitTokens < 1) {
+            return sendJson(res, 400, { ok: false, error: 'scopeKey and a positive safe integer limitTokens are required' })
+          }
+          if (store.state(scopeKey).open === undefined) {
+            return sendJson(res, 404, { ok: false, error: `scope not found: ${scopeKey}` })
+          }
+          store.appendAdjust(scopeKey, limitTokens)
+          return sendJson(res, 200, {
+            ok: true,
+            status: budgetStatus(store, config, scopeKey, false, logger, missingUsage),
+          })
+        }
+        if (req.method === 'POST' && path === '/reset') {
+          const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey.trim() : ''
+          if (scopeKey.length === 0) {
+            return sendJson(res, 400, { ok: false, error: 'scopeKey is required' })
+          }
+          if (store.state(scopeKey).open === undefined) {
+            return sendJson(res, 404, { ok: false, error: `scope not found: ${scopeKey}` })
+          }
+          store.appendReset(scopeKey)
+          return sendJson(res, 200, {
+            ok: true,
+            status: budgetStatus(store, config, scopeKey, false, logger, missingUsage),
+          })
+        }
+        return sendJson(res, 404, { ok: false, error: `not found: ${path}` })
+      } catch (error: unknown) {
+        return sendJson(res, 500, {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    },
+  }), 'agent-budget: settings-api')
 }

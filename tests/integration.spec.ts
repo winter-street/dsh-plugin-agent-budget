@@ -54,6 +54,7 @@ describe('DSH runtime integration', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
+    ctx.provide('webServer', { register: () => () => undefined })
     const fiber = ctx.plugin({ name, inject, apply }, { maxTokens: 10, storageDir })
     await fiber.await()
     const adapter = new MockAdapter()
@@ -91,6 +92,7 @@ describe('DSH runtime integration', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
+    ctx.provide('webServer', { register: () => () => undefined })
     const fiber = ctx.plugin({ name, inject, apply }, { maxTokens: 100, storageDir })
     await fiber.await()
 

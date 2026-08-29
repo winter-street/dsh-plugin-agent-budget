@@ -104,6 +104,18 @@ The plugin registers one read-only tool:
 
 The model can use this tool to self-regulate its remaining token budget.
 
+## Settings panel and HTTP API
+
+The plugin registers a `settings.section` web panel and a prefix HTTP route at
+`/agent-budget/api`.
+
+- `GET /scopes` returns every open budget scope with its current status.
+- `POST /adjust-limit` appends an `adjust` line that overwrites the scope limit.
+- `POST /reset` appends a `reset` line that clears usage but keeps the limit.
+
+Both operations keep the ledger append-only. Replaying `ledger.jsonl` yields
+the same state as incremental application.
+
 ## Known limitations
 
 - The `agent/request-error` handler matches

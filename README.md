@@ -17,7 +17,9 @@ descendants can spend from one durable budget.
 - keeps the ledger append-only, replayable, and recoverable;
 - gives the model itself a read-only `budget_status` tool, not just a human
   command;
-- has **no UI or external service** dependency and can be installed as a plain
+- ships a **settings page panel** to list scopes, adjust limits, and reset
+  usage without touching ledger files by hand;
+- has **no external service** dependency and can be installed as a plain
   bundle;
 - keeps a narrow scope: durable, replayable, fail-closed token accounting for
   agent trees.
@@ -86,6 +88,23 @@ The plugin exports four named members and **no default export**:
 The model can call the read-only `budget_status` tool. It returns the limit,
 used and remaining tokens, exhaustion state, all four usage buckets,
 `meteringComplete`, and `unmeteredCalls`. It cannot change the limit.
+
+## Settings panel and HTTP API
+
+The web client registers a `Token 预算` section in Settings. It lists every
+open budget scope, shows limit/used/remaining/exhausted state with a progress
+bar, and polls every 30 seconds.
+
+Host HTTP API under `/agent-budget/api`:
+
+- `GET /scopes` → `{ ok, scopes: [{ scopeKey, limitTokens, usedTokens, ... }] }`
+- `POST /adjust-limit` with `{ scopeKey, limitTokens }` → overwrites the scope's
+  limit
+- `POST /reset` with `{ scopeKey }` → clears usage but keeps the current limit
+
+`adjust` and `reset` are appended to the sidecar ledger as new event lines.
+Old `open`/`sample` lines are never modified, so replaying the ledger after a
+reload produces the same result as incremental updates.
 
 ## Semantics
 

@@ -33,11 +33,16 @@ export class TestHarness {
   readonly sessionsById = new Map<string, Session>()
   readonly streamHandlers: StreamHandler[] = []
   readonly requestErrorHandlers: RequestErrorHandler[] = []
+  readonly webServerRoutes: Array<{ kind: string; path: string; handler: (...args: any[]) => unknown }> = []
   readonly storageDir: string
   tool: ToolDefinition | undefined
 
   readonly context = {
     get: () => undefined,
+    effect: (callback: () => unknown) => {
+      const result = callback()
+      return typeof result === 'function' ? result : () => undefined
+    },
     logger: loggerMock,
     sessions: {
       get: (id: string) => this.sessionsById.get(id),
@@ -49,6 +54,12 @@ export class TestHarness {
         return () => {
           if (this.tool === tool) this.tool = undefined
         }
+      },
+    },
+    webServer: {
+      register: (route: { kind: string; path: string; handler: (...args: any[]) => unknown }) => {
+        this.webServerRoutes.push(route)
+        return () => undefined
       },
     },
     on: (name: string, handler: unknown) => {
@@ -131,6 +142,38 @@ export class TestHarness {
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  async callApi(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<{ code: number; body: Record<string, unknown> }> {
+    const route = this.webServerRoutes.find(item => item.path === '/agent-budget/api')
+    if (route === undefined) throw new Error('agent-budget API route was not registered')
+    const req = {
+      method,
+      url: `/agent-budget/api${path}`,
+      [Symbol.asyncIterator]: async function* (): AsyncGenerator<Buffer> {
+        if (body !== undefined) yield Buffer.from(JSON.stringify(body))
+      },
+    }
+    return new Promise((resolve, reject) => {
+      const res = {
+        code: 200,
+        writeHead(code: number) {
+          this.code = code
+        },
+        end(bodyText: string) {
+          try {
+            resolve({ code: this.code, body: JSON.parse(bodyText) as Record<string, unknown> })
+          } catch (error) {
+            reject(error)
+          }
+        },
+      }
+      Promise.resolve(route.handler(req as never, res as never)).catch(reject)
+    })
   }
 }
 

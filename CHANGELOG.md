@@ -10,11 +10,21 @@
 - Scope resolution now prefers DSH runtime agent ownership and falls back to a
   per-session budget when a tree root cannot be resolved safely.
 - Added `scope: session | tree` configuration (default `tree`).
+- Runtime ownership lookup is cached and invalidated on `agent/created` /
+  `agent/disposed`, avoiding O(n²) rebuilds per `llm/stream` call.
+- `inject` now includes `agents`, so a missing Agent Registry fails loudly at
+  load instead of silently degrading scope resolution.
+- Migration script writes zstd logs back as header-frame + event-frame and
+  omits the event frame when no events remain, matching DSH startup
+  requirements.
 
 ### Added
 
 - `scripts/migrate-session-log.mjs` migrates legacy `budget/*` session events
   into the sidecar ledger and removes them from session logs.
+- `tests/migrate-session-log.spec.ts` covers multi-frame zstd migration, empty
+  event-frame handling, ledger/index output, and backup creation.
+- README and design docs document the single-process `storageDir` limitation.
 
 ## [0.1.0] - 2026-08-17
 

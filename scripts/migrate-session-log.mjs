@@ -28,7 +28,8 @@ import {
   appendFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, relative } from 'node:path'
+import { join, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const EVENT_VERSION = 1
 const BUDGET_TYPES = new Set(['budget/open', 'budget/sample', 'budget/unmetered'])
@@ -252,18 +253,7 @@ function stripBudgetEvents(header, events) {
   return { ledgerLines, scopeKey, filtered, newHeader }
 }
 
-async function main() {
-  const args = process.argv.slice(2)
-  let homeOverride
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === '--dsh-home') {
-      homeOverride = args[i + 1]
-      i += 1
-    } else {
-      console.error(`unknown argument: ${args[i]}`)
-      process.exit(2)
-    }
-  }
+export async function migrateSessionLog(homeOverride) {
   const home = dshHome(homeOverride)
   const sessionsRoot = join(home, 'sessions')
   const budgetDir = join(home, 'agent-budget')
@@ -356,9 +346,28 @@ async function main() {
   console.log(
     `done: ${migratedFiles} session log(s) migrated, ${removedEvents} budget event(s) removed, ${skipped} skipped`,
   )
+  return { migratedFiles, removedEvents, skipped }
 }
 
-main().catch((error) => {
-  console.error(`migration failed: ${error instanceof Error ? error.message : String(error)}`)
-  process.exit(1)
-})
+async function main() {
+  const args = process.argv.slice(2)
+  let homeOverride
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--dsh-home') {
+      homeOverride = args[i + 1]
+      i += 1
+    } else {
+      console.error(`unknown argument: ${args[i]}`)
+      process.exit(2)
+    }
+  }
+  await migrateSessionLog(homeOverride)
+}
+
+if (process.argv[1] !== undefined
+  && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(`migration failed: ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  })
+}

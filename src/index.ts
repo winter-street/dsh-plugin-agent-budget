@@ -9,10 +9,11 @@ import z from '@deepseek-ai/schemastery'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
+import type { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'agent-budget'
-export const inject = ['llm', 'sessions', 'tools']
+export const inject = ['llm', 'sessions', 'tools', 'agents']
 
 const EVENT_VERSION = 1 as const
 const EXHAUSTED_CODE = 'TOKEN_BUDGET_EXHAUSTED'
@@ -141,6 +142,12 @@ interface BudgetStatus {
   unmeteredCalls: number
 }
 
+interface OwnershipCache {
+  generation: number
+  builtGeneration: number
+  ownerByChild: Map<string, string> | undefined
+}
+
 const ZERO_USAGE: Readonly<UsageBuckets> = Object.freeze({
   inputTokens: 0,
   cacheReadTokens: 0,
@@ -199,6 +206,14 @@ function emptyState(): LedgerState {
     samples: new Map(),
     unmetered: new Set(),
     usage: { ...ZERO_USAGE },
+  }
+}
+
+function createOwnershipCache(): OwnershipCache {
+  return {
+    generation: 0,
+    builtGeneration: -1,
+    ownerByChild: undefined,
   }
 }
 
@@ -437,35 +452,38 @@ function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
   })()
 }
 
-function runtimeRoot(ctx: Context, sessionId: string): string | undefined {
-  const agents = ctx.get('agents')
+function runtimeRoot(ctx: Context, sessionId: string, cache: OwnershipCache): string | undefined {
+  const agents = ctx.get('agents') as AgentRegistry | undefined
   if (agents === undefined) return undefined
   const live = agents.list()
   if (live.length === 0) return undefined
-  const ownerByChild = new Map<string, { session: { id: string } }>()
-  for (const child of live) {
-    const childId = child.session.id
-    for (const candidate of live) {
-      if (candidate.session.id === childId) continue
-      if (agents.isOwnedBy(childId, candidate)) {
-        ownerByChild.set(childId, candidate)
-        break
+  let ownerByChild = cache.ownerByChild
+  if (ownerByChild === undefined || cache.builtGeneration !== cache.generation) {
+    ownerByChild = new Map<string, string>()
+    for (const child of live) {
+      const childId = String(child.session.id)
+      for (const candidate of live) {
+        if (String(candidate.session.id) === childId) continue
+        if (agents.isOwnedBy(child.session.id, candidate)) {
+          ownerByChild.set(childId, String(candidate.session.id))
+          break
+        }
       }
     }
+    cache.ownerByChild = ownerByChild
+    cache.builtGeneration = cache.generation
   }
   const agent = agents.get(SessionId(sessionId))
   if (agent === undefined) return undefined
   const visited = new Set<string>()
-  let current: { session: { id: string } } | undefined = agent
-  while (current !== undefined) {
-    const id = current.session.id
-    if (visited.has(id)) return undefined
-    visited.add(id)
-    const owner = ownerByChild.get(id)
-    if (owner === undefined) return id
-    current = owner
+  let currentId = String(agent.session.id)
+  for (;;) {
+    if (visited.has(currentId)) return undefined
+    visited.add(currentId)
+    const ownerId = ownerByChild.get(currentId)
+    if (ownerId === undefined) return currentId
+    currentId = ownerId
   }
-  return undefined
 }
 
 function durableRoot(ctx: Context, sessionId: string): string | undefined {
@@ -491,15 +509,25 @@ function resolveScopeKey(
   sessionId: string,
   scope: ScopeMode,
   logger: ReturnType<Context['logger']>,
+  cache: OwnershipCache,
 ): string {
   if (scope === 'session') return sessionId
-  const indexed = store.lookupScope(sessionId)
-  if (indexed !== undefined) return indexed
-  const runtime = runtimeRoot(ctx, sessionId)
+  const runtime = runtimeRoot(ctx, sessionId, cache)
   if (runtime !== undefined) {
+    const indexed = store.lookupScope(sessionId)
+    if (indexed !== undefined && indexed !== runtime) {
+      logger.warn(
+        'agent-budget: corrected scope index for session %s: %s -> %s',
+        sessionId,
+        indexed,
+        runtime,
+      )
+    }
     store.bindSession(sessionId, runtime)
     return runtime
   }
+  const indexed = store.lookupScope(sessionId)
+  if (indexed !== undefined) return indexed
   const durable = durableRoot(ctx, sessionId)
   if (durable !== undefined) {
     store.bindSession(sessionId, durable)
@@ -568,6 +596,7 @@ export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('agent-budget')
   const store = new LedgerStore(storageDir)
   store.load()
+  const ownershipCache = createOwnershipCache()
 
   // Old plugin versions wrote budget events into session logs. Keep the event
   // vocabulary registered so those logs remain readable while the migration
@@ -576,6 +605,13 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error('agent-budget: DSH known-event registry is not extensible')
   }
   for (const type of EVENT_TYPES) KNOWN_SESSION_EVENT_TYPES.add(type)
+
+  ctx.on('agent/created', () => {
+    ownershipCache.generation += 1
+  })
+  ctx.on('agent/disposed', () => {
+    ownershipCache.generation += 1
+  })
 
   const createStatus = (scopeKey: string, create: boolean): BudgetStatus => {
     return budgetStatus(store, config, scopeKey, create, logger, missingUsage)
@@ -595,7 +631,7 @@ export function apply(ctx: Context, config: Config): void {
       purpose,
     })
 
-    const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger)
+    const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger, ownershipCache)
     const before = createStatus(scopeKey, true)
     if (before.exhausted) {
       logger.warn(
@@ -719,7 +755,7 @@ export function apply(ctx: Context, config: Config): void {
         throw new Error('budget_status requires an owning agent session')
       }
       const sessionId = String(exec.agent.session.id)
-      const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger)
+      const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger, ownershipCache)
       return createStatus(scopeKey, false)
     },
     presentCall: () => ({ card: 'generic', title: 'Token budget status', kind: 'other' }),

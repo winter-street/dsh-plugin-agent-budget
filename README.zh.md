@@ -104,11 +104,13 @@ usage、`meteringComplete` 和 `unmeteredCalls`。工具不能修改预算。
 
 - 新版本**不再向 Session 日志写入任何 `budget/*` 事件**；
 - 卸载插件后，DSH 可以直接打开所有会话；
-- 彻底清除预算数据，删除 `~/.dsh/agent-budget/` 即可。
+- 彻底清除预算数据，删除 `~/.dsh/agent-budget/` 即可；
+- 同一个 `storageDir` 同一时间只应由一个 DSH 进程使用。若 `headless` 与
+  `web` 同时运行，请为不同 profile 配置不同的 `storageDir`，或避免同时写同一账本。
 
 ## 旧数据迁移
 
-`0.1.0` 之前（或本仓库早期版本）写入过 Session 日志的 `budget/*` 事件需要迁移：
+`0.1.0` 之前（或本仓库早期版本）写入过 Session 日志的 `budget/*` 事件，请在升级使用这些版本的 profile 前执行一次迁移：
 
 ```bash
 node scripts/migrate-session-log.mjs

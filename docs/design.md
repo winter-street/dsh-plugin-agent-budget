@@ -112,6 +112,9 @@ The model can use this tool to self-regulate its remaining token budget.
   reuses the code, the boundary must be tightened.
 - `scope: tree` may fall back to independent budgets in extreme cold-start
   cases. This is intentional: under-sharing is safer than over-sharing.
+- One `storageDir` supports one DSH process at a time. Concurrent `headless`
+  and `web` processes must use distinct `storageDir` values or serialize access
+  to the ledger.
 - Concurrent admission can overshoot the limit by design.
 - Metering is fail-closed by default.
 - Verified against DSH `0.1.0-rc.5`; when upgrading DSH, re-check the

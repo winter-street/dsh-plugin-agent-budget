@@ -119,10 +119,14 @@ The plugin stores its ledger in:
 - New versions **never write `budget/*` events into session logs**.
 - After uninstalling the plugin, DSH can open every session normally.
 - To fully remove budget data, delete `~/.dsh/agent-budget/`.
+- One `storageDir` is intended for one DSH process at a time. If `headless`
+  and `web` run concurrently, give each profile a distinct `storageDir` or do
+  not run them against the same ledger simultaneously.
 
 ## Migrating legacy session logs
 
 Versions before this sidecar design wrote `budget/*` events into session logs.
+Run the migration once before upgrading a profile that used those versions.
 Migrate them with:
 
 ```bash

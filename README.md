@@ -8,10 +8,7 @@ descendants spend from one durable budget.
 > not published to npm yet; it is developed as an open-source contribution to
 > the DSH plugin ecosystem.
 
-## Why another budget plugin?
-
-When this plugin was designed, the DSH ecosystem did not have a small,
-self-contained token-budget plugin that:
+## Highlights
 
 - treats a whole **agent tree** as one budget account;
 - persists the budget ledger **inside the session log**, so it survives reloads
@@ -19,12 +16,9 @@ self-contained token-budget plugin that:
 - gives the model itself a read-only `budget_status` tool, not just a human
   command;
 - has **no UI or external service** dependency and can be installed as a plain
-  bundle.
-
-The ecosystem now contains several other budget/cost plugins. This project
-intentionally stays lightweight: it focuses on durable, replayable, fail-closed
-token accounting for agent trees, leaving cost panels, carbon estimation, and
-per-turn limits to more specialized plugins.
+  bundle;
+- keeps a narrow scope: durable, replayable, fail-closed token accounting for
+  agent trees.
 
 ## Install
 
@@ -128,22 +122,6 @@ ignorable append option.
 - Concurrent admission can overshoot the limit by design (see Semantics).
 - Metering is fail-closed by default: providers that intentionally omit usage
   need `missingUsage: 'ignore'`.
-
-## Related projects
-
-- [vibeinging/dsh-agent-budget](https://github.com/vibeinging/dsh-agent-budget) —
-  native agent-tree token budget with concurrency-safe reservations and
-  `/budget` command.
-- [PerryLink/dsh-budget](https://github.com/PerryLink/dsh-budget) — broader cost
-  governance: USD/carbon/latency metering, budget caps, alerts, and a Settings
-  panel.
-- [dsh-token-budget](https://www.npmjs.com/package/dsh-token-budget) — cumulative
-  token usage, cache-hit rate, and per-model/per-period cost estimates.
-- [dsh-turn-budget](https://www.npmjs.com/package/dsh-turn-budget) — per-turn
-  step/tool-call/provider-token budgets.
-
-This project differentiates itself by keeping the scope narrow: **durable
-agent-tree token budget with a model-visible status tool, no UI required.**
 
 ## Repository layout
 

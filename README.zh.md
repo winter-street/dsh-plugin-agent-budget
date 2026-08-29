@@ -7,18 +7,13 @@ Token 预算插件。根 Agent、one-shot/continuable subagent 以及 workflow �
 > **状态**：实验性，已验证 DSH `0.1.0-rc.5`。目前尚未发布到 npm，作为 DSH 插件生态的
 > 开源贡献持续开发中。
 
-## 为什么还需要一个预算插件？
-
-本插件设计时，DSH 生态里还没有一个轻量、自包含的 Token 预算插件能同时做到：
+## 亮点
 
 - 把整棵 **Agent 树** 当作一个预算账户；
 - 把预算账本 **持久化进 Session 日志**，可重放、可恢复；
 - 给模型本身提供只读的 `budget_status` 工具，而不只是人类命令；
-- **无 UI / 无外部服务**，可作为普通 bundle 安装。
-
-现在 DSH 生态已经出现了若干预算/成本插件。本项目刻意保持轻量：聚焦“Agent 树级、
-可持久化、可重放、fail-closed 的 Token 记账”，把成本面板、碳足迹、per-turn 限制等交给
-更专门的插件。
+- **无 UI / 无外部服务**，可作为普通 bundle 安装；
+- 保持范围狭窄：聚焦“Agent 树级、可持久化、可重放、fail-closed 的 Token 记账”。
 
 ## 安装
 
@@ -107,20 +102,6 @@ DSH reader 会拒绝这些 Session，而不是静默丢弃预算状态。等 DSH
 - 并发准入可能造成有限超额，这是设计取舍（README 语义已声明）。
 - 计量不完整时默认 fail-closed：明确不返回 usage 的 provider 请配置
   `missingUsage: 'ignore'`。
-
-## 相关项目
-
-- [vibeinging/dsh-agent-budget](https://github.com/vibeinging/dsh-agent-budget) —
-  Agent 树级原生 Token 预算，带并发安全 reservation 和 `/budget` 命令。
-- [PerryLink/dsh-budget](https://github.com/PerryLink/dsh-budget) — 更完整的成本治理：
-  USD/碳/延迟计量、预算上限、告警和 Settings 面板。
-- [dsh-token-budget](https://www.npmjs.com/package/dsh-token-budget) — 累计 token 用量、
-  缓存命中率、按模型/时段估算成本。
-- [dsh-turn-budget](https://www.npmjs.com/package/dsh-turn-budget) — per-turn 的
-  step/tool-call/provider token 预算。
-
-本项目刻意保持范围狭窄：**可持久化的 Agent 树 Token 预算 + 模型可见的只读状态工具，
-不需要 UI。**
 
 ## 仓库结构
 

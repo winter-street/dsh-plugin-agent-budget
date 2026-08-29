@@ -4,3 +4,4 @@
       config:
         maxTokens: 200000
         missingUsage: exhaust
+        scope: tree

@@ -52,7 +52,7 @@ describe('accounting', () => {
       meteringComplete: true,
       unmeteredCalls: 0,
     })
-    expect(root.events.filter(event => event.type === 'budget/sample')).toHaveLength(3)
+    expect(harness.ledgerLines().filter(line => line.type === 'sample')).toHaveLength(3)
   })
 
   it('shares a root budget across parent, siblings, and workflow descendants', async () => {
@@ -69,8 +69,24 @@ describe('accounting', () => {
 
     const statuses = await Promise.all([root, first, second, workflow].map(session => harness.status(session)))
     for (const status of statuses) expect(status).toMatchObject({ usedTokens: 75, remainingTokens: 25 })
-    expect(first.events.some(event => event.type.startsWith('budget/'))).toBe(false)
-    expect(second.events.some(event => event.type.startsWith('budget/'))).toBe(false)
+    for (const session of [root, first, second, workflow]) {
+      expect(session.events.some(event => event.type.startsWith('budget/'))).toBe(false)
+    }
+    expect(harness.ledgerLines().filter(line => line.type === 'sample')).toHaveLength(4)
+  })
+
+  it('honors scope: session by keeping subagent children independent', async () => {
+    const harness = new TestHarness({ maxTokens: 100, scope: 'session' })
+    const root = harness.root('session-scope-root')
+    const first = harness.child('session-scope-first', root)
+    const second = harness.child('session-scope-second', root)
+
+    await harness.stream(first, [usage({ inputTokens: 80, outputTokens: 5 }), finish()])
+    await harness.stream(second, [usage({ inputTokens: 10, outputTokens: 2 }), finish()])
+
+    expect(await harness.status(first)).toMatchObject({ usedTokens: 85, exhausted: false })
+    expect(await harness.status(second)).toMatchObject({ usedTokens: 12, exhausted: false })
+    expect(await harness.status(root)).toMatchObject({ usedTokens: 0, exhausted: false })
   })
 
   it('isolates unrelated roots and ordinary forks, including inherited ledger events', async () => {
@@ -86,7 +102,8 @@ describe('accounting', () => {
     expect(await harness.status(original)).toMatchObject({ usedTokens: 41 })
     expect(await harness.status(fork)).toMatchObject({ usedTokens: 7 })
     expect(await harness.status(unrelated)).toMatchObject({ usedTokens: 11 })
-    expect(fork.events.filter(event => event.type === 'budget/open')).toHaveLength(2)
+    expect(fork.events.some(event => event.type.startsWith('budget/'))).toBe(false)
+    expect(harness.ledgerLines().filter(line => line.type === 'open')).toHaveLength(3)
   })
 
   it('counts compaction, title generation, and usage reported before failure', async () => {
@@ -97,7 +114,7 @@ describe('accounting', () => {
     await harness.stream(root, [usage({ inputTokens: 7, outputTokens: 3 }), finish('error')])
 
     expect(await harness.status(root)).toMatchObject({ usedTokens: 24 })
-    expect(root.events.filter(event => event.type === 'budget/sample').map(event => event.data.purpose))
+    expect(harness.ledgerLines().filter(line => line.type === 'sample').map(line => line.purpose))
       .toEqual(['compaction', 'session-title', 'conversation'])
   })
 
@@ -107,6 +124,7 @@ describe('accounting', () => {
     await harness.stream(undefined, [usage({ inputTokens: 100, outputTokens: 100 }), finish()])
     expect(await harness.status(root)).toMatchObject({ usedTokens: 0, remainingTokens: 10 })
     expect(root.events.some(event => event.type.startsWith('budget/'))).toBe(false)
+    expect(harness.ledgerLines()).toHaveLength(0)
   })
 })
 
@@ -181,6 +199,7 @@ describe('admission and incomplete metering', () => {
     })).rejects.toThrow('non-empty')
     expect(providerCalls).toBe(0)
     expect(root.events.filter(event => event.type.startsWith('budget/'))).toHaveLength(0)
+    expect(harness.ledgerLines()).toHaveLength(0)
   })
 })
 
@@ -190,7 +209,7 @@ describe('replay and lifecycle', () => {
     const first = firstHarness.root('durable')
     await firstHarness.stream(first, [usage({ inputTokens: 30, outputTokens: 5 }), finish()])
 
-    const secondHarness = new TestHarness({ maxTokens: 999 })
+    const secondHarness = new TestHarness({ maxTokens: 999, storageDir: firstHarness.storageDir })
     const resumed = secondHarness.resume(first)
     expect(await secondHarness.status(resumed)).toMatchObject({
       limitTokens: 50,
@@ -211,10 +230,11 @@ describe('replay and lifecycle', () => {
     expect(await harness.status(root)).toEqual(await harness.status(child))
   })
 
-  it('keeps plugin events accepted when reconstructing a session', async () => {
+  it('keeps sessions reconstructable without plugin events in the log', async () => {
     const harness = new TestHarness({ maxTokens: 10 })
     const root = harness.root('reconstruct')
     await harness.stream(root, [usage({ inputTokens: 1 }), finish()])
+    expect(root.events.filter(event => event.type.startsWith('budget/'))).toHaveLength(0)
     expect(() => Session.create(root.id, root.events, root.header)).not.toThrow()
   })
 })

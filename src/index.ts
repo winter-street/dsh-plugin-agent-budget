@@ -1,12 +1,15 @@
 /** Shared, replayable token budgets for one DSH agent tree. */
 
 import { randomUUID } from 'node:crypto'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'agent-budget'
@@ -17,6 +20,7 @@ const EXHAUSTED_CODE = 'TOKEN_BUDGET_EXHAUSTED'
 const EVENT_TYPES = ['budget/open', 'budget/sample', 'budget/unmetered'] as const
 
 type MissingUsagePolicy = 'exhaust' | 'ignore'
+type ScopeMode = 'session' | 'tree'
 
 interface UsageBuckets {
   inputTokens: number
@@ -25,6 +29,10 @@ interface UsageBuckets {
   outputTokens: number
 }
 
+/**
+ * DSH session-event payloads. Kept only for backward compatibility with logs
+ * written by earlier plugin versions; the runtime no longer appends them.
+ */
 interface BudgetOpen {
   version: typeof EVENT_VERSION
   rootSessionId: string
@@ -63,24 +71,65 @@ declare module '@deepseek-ai/dsh-session' {
   }
 }
 
-/** Plugin configuration. The limit is fixed in a root session's first open event. */
+/** Plugin configuration. The limit is fixed in a budget scope's first open event. */
 export interface Config {
   maxTokens: number
   missingUsage?: MissingUsagePolicy
+  scope?: ScopeMode
+  storageDir?: string
 }
 
 /** Loader-facing schema; runtime validation also protects direct plugin calls. */
 export const Config: z<Config> = z.object({
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).required(),
   missingUsage: z.union(['exhaust', 'ignore'] as const).default('exhaust'),
+  scope: z.union(['session', 'tree'] as const).default('tree'),
+  storageDir: z.string(),
 })
 
+/** One append-only ledger line in the plugin-owned sidecar store. */
+type LedgerLine =
+  | {
+    type: 'open'
+    version: typeof EVENT_VERSION
+    scopeKey: string
+    epochId: string
+    limitTokens: number
+  }
+  | {
+    type: 'sample'
+    version: typeof EVENT_VERSION
+    scopeKey: string
+    callId: string
+    sessionId: string
+    provider: string
+    model: string
+    purpose: BudgetSample['purpose']
+    usage: UsageBuckets
+  }
+  | {
+    type: 'unmetered'
+    version: typeof EVENT_VERSION
+    scopeKey: string
+    callId: string
+    sessionId: string
+    provider: string
+    model: string
+    purpose: BudgetSample['purpose']
+  }
+
 interface LedgerState {
-  consumedEvents: number
-  open: BudgetOpen | undefined
+  open: LedgerOpen | undefined
   samples: Map<string, UsageBuckets>
   unmetered: Set<string>
   usage: UsageBuckets
+}
+
+interface LedgerOpen {
+  version: typeof EVENT_VERSION
+  scopeKey: string
+  epochId: string
+  limitTokens: number
 }
 
 interface BudgetStatus {
@@ -109,9 +158,21 @@ class TokenBudgetExhaustedError extends HarnessError {
   }
 }
 
-function validateConfig(config: Config): MissingUsagePolicy {
+function defaultStorageDir(): string {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'agent-budget')
+}
+
+function validateConfig(config: Config): {
+  missingUsage: MissingUsagePolicy
+  scope: ScopeMode
+  storageDir: string
+} {
   for (const key of Object.keys(config)) {
-    if (key !== 'maxTokens' && key !== 'missingUsage') {
+    if (key !== 'maxTokens'
+      && key !== 'missingUsage'
+      && key !== 'scope'
+      && key !== 'storageDir') {
       throw new TypeError(`agent-budget: unknown config key ${JSON.stringify(key)}`)
     }
   }
@@ -122,12 +183,19 @@ function validateConfig(config: Config): MissingUsagePolicy {
   if (missingUsage !== 'exhaust' && missingUsage !== 'ignore') {
     throw new TypeError('agent-budget: missingUsage must be "exhaust" or "ignore"')
   }
-  return missingUsage
+  const scope = config.scope ?? 'tree'
+  if (scope !== 'session' && scope !== 'tree') {
+    throw new TypeError('agent-budget: scope must be "session" or "tree"')
+  }
+  const storageDir = config.storageDir ?? defaultStorageDir()
+  if (storageDir.length === 0) {
+    throw new TypeError('agent-budget: storageDir must be a non-empty path')
+  }
+  return { missingUsage, scope, storageDir }
 }
 
 function emptyState(): LedgerState {
   return {
-    consumedEvents: 0,
     open: undefined,
     samples: new Map(),
     unmetered: new Set(),
@@ -179,37 +247,6 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 
-function usageInteger(value: unknown, bucket: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`agent-budget: budget/sample usage.${bucket} must be a non-negative safe integer`)
-  }
-  return value
-}
-
-function usageFromUnknown(value: unknown): UsageBuckets {
-  if (!isRecord(value)) throw new Error('agent-budget: budget/sample usage must be an object')
-  return {
-    inputTokens: usageInteger(value.inputTokens, 'inputTokens'),
-    cacheReadTokens: usageInteger(value.cacheReadTokens, 'cacheReadTokens'),
-    cacheWriteTokens: usageInteger(value.cacheWriteTokens, 'cacheWriteTokens'),
-    outputTokens: usageInteger(value.outputTokens, 'outputTokens'),
-  }
-}
-
-function assertSubject(data: unknown, type: string): void {
-  if (!isRecord(data)
-    || data.version !== EVENT_VERSION
-    || !nonEmptyString(data.rootSessionId)
-    || !nonEmptyString(data.epochId)
-    || !nonEmptyString(data.callId)
-    || !nonEmptyString(data.sessionId)
-    || !nonEmptyString(data.provider)
-    || !nonEmptyString(data.model)
-    || data.purpose !== 'conversation' && data.purpose !== 'compaction' && data.purpose !== 'session-title') {
-    throw new Error(`agent-budget: invalid ${type} event payload`)
-  }
-}
-
 function assertSubjectFields(fields: {
   sessionId: string
   provider: string
@@ -228,178 +265,343 @@ function assertSubjectFields(fields: {
   }
 }
 
-function assertOpenPayload(data: unknown): asserts data is BudgetOpen {
-  if (!isRecord(data)
-    || data.version !== EVENT_VERSION
-    || !nonEmptyString(data.rootSessionId)
-    || !nonEmptyString(data.epochId)
-    || typeof data.limitTokens !== 'number'
-    || !Number.isSafeInteger(data.limitTokens)
-    || data.limitTokens < 1) {
-    throw new Error('agent-budget: invalid budget/open event payload')
+function isLedgerLine(value: unknown): value is LedgerLine {
+  if (!isRecord(value) || typeof value.version !== 'number' || value.version !== EVENT_VERSION) {
+    return false
   }
+  if (!nonEmptyString(value.scopeKey)) return false
+  if (value.type === 'open') {
+    return nonEmptyString(value.epochId)
+      && typeof value.limitTokens === 'number'
+      && Number.isSafeInteger(value.limitTokens)
+      && value.limitTokens > 0
+  }
+  if (value.type === 'sample' || value.type === 'unmetered') {
+    return nonEmptyString(value.callId)
+      && nonEmptyString(value.sessionId)
+      && nonEmptyString(value.provider)
+      && nonEmptyString(value.model)
+      && (value.purpose === 'conversation'
+        || value.purpose === 'compaction'
+        || value.purpose === 'session-title')
+  }
+  return false
 }
 
-function foldEvent(root: Session, state: LedgerState, event: SessionEvent): void {
-  if (event.type === 'budget/open') {
-    if (!isRecord(event.data)) throw new Error('agent-budget: invalid budget/open event payload')
-    if (event.data.rootSessionId !== root.id) return
+function foldLedgerLine(scopeKey: string, state: LedgerState, line: LedgerLine): void {
+  if (line.scopeKey !== scopeKey) return
+  if (line.type === 'open') {
     if (state.open === undefined) {
-      assertOpenPayload(event.data)
       state.open = {
         version: EVENT_VERSION,
-        rootSessionId: root.id,
-        epochId: event.data.epochId,
-        limitTokens: event.data.limitTokens,
+        scopeKey: line.scopeKey,
+        epochId: line.epochId,
+        limitTokens: line.limitTokens,
       }
     }
     return
   }
-  const open = state.open
-  if (open === undefined) return
-  if (event.type === 'budget/sample') {
-    if (!isRecord(event.data)) throw new Error('agent-budget: invalid budget/sample event payload')
-    if (event.data.rootSessionId !== root.id || event.data.epochId !== open.epochId) return
-    assertSubject(event.data, 'budget/sample')
-    const usage = usageFromUnknown(event.data.usage)
-    const previous = state.samples.get(event.data.callId)
+  const ledgerOpen = state.open
+  if (ledgerOpen === undefined) return
+  if (line.type === 'sample') {
+    const previous = state.samples.get(line.callId)
     if (previous !== undefined) add(state.usage, previous, -1)
-    state.samples.set(event.data.callId, usage)
-    state.unmetered.delete(event.data.callId)
-    add(state.usage, usage, 1)
+    state.samples.set(line.callId, line.usage)
+    state.unmetered.delete(line.callId)
+    add(state.usage, line.usage, 1)
     return
   }
-  if (event.type === 'budget/unmetered') {
-    if (!isRecord(event.data)) throw new Error('agent-budget: invalid budget/unmetered event payload')
-    if (event.data.rootSessionId !== root.id || event.data.epochId !== open.epochId) return
-    assertSubject(event.data, 'budget/unmetered')
-    if (!state.samples.has(event.data.callId)) state.unmetered.add(event.data.callId)
+  if (line.type === 'unmetered') {
+    if (!state.samples.has(line.callId)) state.unmetered.add(line.callId)
   }
 }
 
-function resolveRoot(ctx: Context, sessionId: GenerateOptions['sessionId']): Session {
-  if (sessionId === undefined) throw new Error('agent-budget: a session id is required')
-  let session = ctx.sessions.get(sessionId)
-  if (session === undefined) {
-    throw new Error(`agent-budget: session ${JSON.stringify(sessionId)} is not live`)
-  }
-  const visited = new Set<string>()
-  while (session.header.origin === 'subagent') {
-    if (visited.has(session.id)) throw new Error('agent-budget: cyclic subagent session lineage')
-    visited.add(session.id)
-    const parentId = session.header.parentSession
-    if (parentId === undefined) {
-      throw new Error(`agent-budget: subagent session ${JSON.stringify(session.id)} has no parent`)
-    }
-    const parent = ctx.sessions.get(parentId)
-    if (parent === undefined) {
-      throw new Error(
-        `agent-budget: parent session ${JSON.stringify(parentId)} for ${JSON.stringify(session.id)} is not live`,
-      )
-    }
-    session = parent
-  }
-  return session
+function ensureDir(dir: string): void {
+  mkdirSync(dir, { recursive: true })
 }
 
-function denial(status: BudgetStatus): AsyncIterable<StreamChunk> {
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+  renameSync(tmp, file)
+}
+
+function appendLedgerLine(file: string, line: LedgerLine): void {
+  appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8')
+}
+
+class LedgerStore {
+  private readonly ledgerPath: string
+  private readonly indexPath: string
+  readonly states = new Map<string, LedgerState>()
+  private readonly scopeIndex = new Map<string, string>()
+
+  constructor(readonly dir: string) {
+    this.ledgerPath = join(dir, 'ledger.jsonl')
+    this.indexPath = join(dir, 'scope-index.json')
+  }
+
+  load(): void {
+    ensureDir(this.dir)
+    if (existsSync(this.indexPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(this.indexPath, 'utf8')) as unknown
+        if (isRecord(parsed)) {
+          for (const [sessionId, scopeKey] of Object.entries(parsed)) {
+            if (nonEmptyString(sessionId) && nonEmptyString(scopeKey)) {
+              this.scopeIndex.set(sessionId, scopeKey)
+            }
+          }
+        }
+      } catch {
+        // A corrupt index is not fatal: runtime ownership can rebuild it.
+      }
+    }
+    if (existsSync(this.ledgerPath)) {
+      const lines = readFileSync(this.ledgerPath, 'utf8').split(/\r?\n/)
+      for (const raw of lines) {
+        if (raw.length === 0) continue
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(raw) as unknown
+        } catch {
+          // Tolerate a torn final line after a crash.
+          continue
+        }
+        if (!isLedgerLine(parsed)) continue
+        let state = this.states.get(parsed.scopeKey)
+        if (state === undefined) {
+          state = emptyState()
+          this.states.set(parsed.scopeKey, state)
+        }
+        foldLedgerLine(parsed.scopeKey, state, parsed)
+      }
+    }
+  }
+
+  state(scopeKey: string): LedgerState {
+    let state = this.states.get(scopeKey)
+    if (state === undefined) {
+      state = emptyState()
+      this.states.set(scopeKey, state)
+    }
+    return state
+  }
+
+  lookupScope(sessionId: string): string | undefined {
+    return this.scopeIndex.get(sessionId)
+  }
+
+  bindSession(sessionId: string, scopeKey: string): void {
+    if (this.scopeIndex.get(sessionId) === scopeKey) return
+    this.scopeIndex.set(sessionId, scopeKey)
+    writeJsonAtomic(this.indexPath, Object.fromEntries(this.scopeIndex))
+  }
+
+  appendOpen(scopeKey: string, epochId: string, limitTokens: number): void {
+    const line: LedgerLine = {
+      type: 'open',
+      version: EVENT_VERSION,
+      scopeKey,
+      epochId,
+      limitTokens,
+    }
+    appendLedgerLine(this.ledgerPath, line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
+
+  appendSample(scopeKey: string, sample: Omit<Extract<LedgerLine, { type: 'sample' }>, 'type' | 'version'>): void {
+    const line: LedgerLine = {
+      type: 'sample',
+      version: EVENT_VERSION,
+      ...sample,
+    }
+    appendLedgerLine(this.ledgerPath, line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
+
+  appendUnmetered(scopeKey: string, sample: Omit<Extract<LedgerLine, { type: 'unmetered' }>, 'type' | 'version'>): void {
+    const line: LedgerLine = {
+      type: 'unmetered',
+      version: EVENT_VERSION,
+      ...sample,
+    }
+    appendLedgerLine(this.ledgerPath, line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
+}
+
+function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
   return (async function* (): AsyncGenerator<StreamChunk> {
-    if (status.exhausted) throw new TokenBudgetExhaustedError(status)
+    if (budget.exhausted) throw new TokenBudgetExhaustedError(budget)
     yield* []
   })()
 }
 
-/** Register the shared budget gate, usage ledger, and read-only status tool. */
-export function apply(ctx: Context, config: Config): void {
-  const missingUsage = validateConfig(config)
-  const logger = ctx.logger('agent-budget')
-  const states = new WeakMap<Session, LedgerState>()
+function runtimeRoot(ctx: Context, sessionId: string): string | undefined {
+  const agents = ctx.get('agents') as AgentRegistry | undefined
+  if (agents === undefined) return undefined
+  const live = agents.list()
+  if (live.length === 0) return undefined
+  const ownerByChild = new Map<string, { session: { id: string } }>()
+  for (const child of live) {
+    const childId = child.session.id
+    for (const candidate of live) {
+      if (candidate.session.id === childId) continue
+      if (agents.isOwnedBy(childId, candidate)) {
+        ownerByChild.set(childId, candidate)
+        break
+      }
+    }
+  }
+  const agent = agents.get(sessionId as never)
+  if (agent === undefined) return undefined
+  const visited = new Set<string>()
+  let current: { session: { id: string } } | undefined = agent
+  while (current !== undefined) {
+    const id = current.session.id
+    if (visited.has(id)) return undefined
+    visited.add(id)
+    const owner = ownerByChild.get(id)
+    if (owner === undefined) return id
+    current = owner
+  }
+  return undefined
+}
 
-  // rc.5 validates restored event vocabulary against this exported set. The
-  // registration keeps plugin-authored ledgers resumable until DSH exposes a
-  // first-class custom-event registration API.
+function durableRoot(ctx: Context, sessionId: string): string | undefined {
+  const first = ctx.sessions.get(sessionId as never)
+  if (first === undefined) return undefined
+  const visited = new Set<string>()
+  let current = first
+  while (current.header.origin === 'subagent') {
+    if (visited.has(current.id)) return undefined
+    visited.add(current.id)
+    const parentId = current.header.parentSession
+    if (parentId === undefined) return undefined
+    const parent = ctx.sessions.get(parentId)
+    if (parent === undefined) return undefined
+    current = parent
+  }
+  return current.id
+}
+
+function resolveScopeKey(
+  ctx: Context,
+  store: LedgerStore,
+  sessionId: string,
+  scope: ScopeMode,
+  logger: ReturnType<Context['logger']>,
+): string {
+  if (scope === 'session') return sessionId
+  const indexed = store.lookupScope(sessionId)
+  if (indexed !== undefined) return indexed
+  const runtime = runtimeRoot(ctx, sessionId)
+  if (runtime !== undefined) {
+    store.bindSession(sessionId, runtime)
+    return runtime
+  }
+  const durable = durableRoot(ctx, sessionId)
+  if (durable !== undefined) {
+    store.bindSession(sessionId, durable)
+    return durable
+  }
+  logger.warn(
+    'agent-budget: cannot resolve tree root for session %s; falling back to an independent budget',
+    sessionId,
+  )
+  store.bindSession(sessionId, sessionId)
+  return sessionId
+}
+
+function openLedger(
+  store: LedgerStore,
+  config: Config,
+  logger: ReturnType<Context['logger']>,
+  scopeKey: string,
+): { state: LedgerState; event: LedgerOpen } {
+  const state = store.state(scopeKey)
+  if (state.open === undefined) {
+    const payload = {
+      version: EVENT_VERSION,
+      scopeKey,
+      epochId: randomUUID(),
+      limitTokens: config.maxTokens,
+    }
+    store.appendOpen(scopeKey, payload.epochId, payload.limitTokens)
+    logger.info(
+      'budget opened: scope=%s epoch=%s limit=%d',
+      payload.scopeKey,
+      payload.epochId,
+      payload.limitTokens,
+    )
+  }
+  if (state.open === undefined) throw new Error('agent-budget: failed to open budget ledger')
+  return { state, event: state.open }
+}
+
+function budgetStatus(
+  store: LedgerStore,
+  config: Config,
+  scopeKey: string,
+  create: boolean,
+  logger: ReturnType<Context['logger']>,
+  missingUsage: MissingUsagePolicy,
+): BudgetStatus {
+  const state = create ? openLedger(store, config, logger, scopeKey).state : store.state(scopeKey)
+  const limitTokens = state.open?.limitTokens ?? config.maxTokens
+  const usedTokens = total(state.usage)
+  const unmeteredCalls = state.unmetered.size
+  return {
+    limitTokens,
+    usedTokens,
+    remainingTokens: Math.max(0, limitTokens - usedTokens),
+    exhausted: usedTokens >= limitTokens || (missingUsage === 'exhaust' && unmeteredCalls > 0),
+    usage: { ...state.usage },
+    meteringComplete: unmeteredCalls === 0,
+    unmeteredCalls,
+  }
+}
+
+/** Register the shared budget gate, sidecar ledger, and read-only status tool. */
+export function apply(ctx: Context, config: Config): void {
+  const { missingUsage, scope, storageDir } = validateConfig(config)
+  const logger = ctx.logger('agent-budget')
+  const store = new LedgerStore(storageDir)
+  store.load()
+
+  // Old plugin versions wrote budget events into session logs. Keep the event
+  // vocabulary registered so those logs remain readable while the migration
+  // tool removes them; new writes go only to the sidecar ledger.
   if (!(KNOWN_SESSION_EVENT_TYPES instanceof Set)) {
     throw new Error('agent-budget: DSH known-event registry is not extensible')
   }
   for (const type of EVENT_TYPES) KNOWN_SESSION_EVENT_TYPES.add(type)
 
-  const sync = (root: Session): LedgerState => {
-    let state = states.get(root)
-    if (state === undefined) {
-      state = emptyState()
-      states.set(root, state)
-    }
-    while (state.consumedEvents < root.events.length) {
-      const event = root.events[state.consumedEvents]
-      if (event === undefined) throw new Error('agent-budget: non-contiguous session log')
-      foldEvent(root, state, event)
-      state.consumedEvents += 1
-    }
-    return state
+  const createStatus = (scopeKey: string, create: boolean): BudgetStatus => {
+    return budgetStatus(store, config, scopeKey, create, logger, missingUsage)
   }
-
-  const open = (root: Session): { state: LedgerState; event: BudgetOpen } => {
-    const state = sync(root)
-    if (state.open === undefined) {
-      const payload = {
-        version: EVENT_VERSION,
-        rootSessionId: root.id,
-        epochId: randomUUID(),
-        limitTokens: config.maxTokens,
-      }
-      assertOpenPayload(payload)
-      root.append('budget/open', payload)
-      sync(root)
-      logger.info(
-        'budget opened: root=%s epoch=%s limit=%d',
-        payload.rootSessionId,
-        payload.epochId,
-        payload.limitTokens,
-      )
-    }
-    if (state.open === undefined) throw new Error('agent-budget: failed to open budget ledger')
-    return { state, event: state.open }
-  }
-
-  const status = (root: Session, create: boolean): BudgetStatus => {
-    const state = create ? open(root).state : sync(root)
-    const limitTokens = state.open?.limitTokens ?? config.maxTokens
-    const usedTokens = total(state.usage)
-    const unmeteredCalls = state.unmetered.size
-    return {
-      limitTokens,
-      usedTokens,
-      remainingTokens: Math.max(0, limitTokens - usedTokens),
-      exhausted: usedTokens >= limitTokens || (missingUsage === 'exhaust' && unmeteredCalls > 0),
-      usage: { ...state.usage },
-      meteringComplete: unmeteredCalls === 0,
-      unmeteredCalls,
-    }
-  }
-
-  ctx.on('session/event', (session) => {
-    if (states.has(session)) sync(session)
-  })
 
   ctx.on('llm/stream', (options, next) => {
     if (options.sessionId === undefined) return next()
-    const root = resolveRoot(ctx, options.sessionId)
+    const sessionId = String(options.sessionId)
     const purpose = purposeOf(options)
 
-    // Fail before any budget event is written or provider work starts: a
-    // subject that cannot be replayed must not be recorded.
+    // Fail before any ledger write or provider work starts: a subject that
+    // cannot be replayed must not be recorded.
     assertSubjectFields({
-      sessionId: options.sessionId,
+      sessionId,
       provider: options.provider,
       model: options.model,
       purpose,
     })
 
-    const before = status(root, true)
+    const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger)
+    const before = createStatus(scopeKey, true)
     if (before.exhausted) {
       logger.warn(
-        'budget exhausted before provider dispatch: root=%s limit=%d used=%d unmetered=%d',
-        root.id,
+        'budget exhausted before provider dispatch: scope=%s limit=%d used=%d unmetered=%d',
+        scopeKey,
         before.limitTokens,
         before.usedTokens,
         before.unmeteredCalls,
@@ -409,17 +611,13 @@ export function apply(ctx: Context, config: Config): void {
 
     const callId = randomUUID()
     const subject = {
-      version: EVENT_VERSION,
-      rootSessionId: root.id,
-      epochId: open(root).event.epochId,
+      scopeKey,
       callId,
-      sessionId: options.sessionId,
+      sessionId,
       provider: options.provider,
       model: options.model,
       purpose,
     }
-    assertSubject(subject, 'budget/sample')
-
     const recordUnmetered = (): void => {
       logger.warn(
         'unmetered llm call recorded: call=%s session=%s provider=%s model=%s',
@@ -428,7 +626,7 @@ export function apply(ctx: Context, config: Config): void {
         subject.provider,
         subject.model,
       )
-      root.append('budget/unmetered', subject)
+      store.appendUnmetered(scopeKey, subject)
     }
 
     const stream = next()
@@ -446,7 +644,7 @@ export function apply(ctx: Context, config: Config): void {
               recordUnmetered()
               throw error
             }
-            root.append('budget/sample', { ...subject, usage })
+            store.appendSample(scopeKey, { ...subject, usage })
             logger.debug(
               'budget sample recorded: call=%s session=%s provider=%s model=%s input=%d cacheRead=%d cacheWrite=%d output=%d',
               callId,
@@ -521,7 +719,9 @@ export function apply(ctx: Context, config: Config): void {
       if (exec.agent === undefined) {
         throw new Error('budget_status requires an owning agent session')
       }
-      return status(resolveRoot(ctx, exec.agent.session.id), false)
+      const sessionId = String(exec.agent.session.id)
+      const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger)
+      return createStatus(scopeKey, false)
     },
     presentCall: () => ({ card: 'generic', title: 'Token budget status', kind: 'other' }),
   }))

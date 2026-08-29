@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -30,9 +33,11 @@ export class TestHarness {
   readonly sessionsById = new Map<string, Session>()
   readonly streamHandlers: StreamHandler[] = []
   readonly requestErrorHandlers: RequestErrorHandler[] = []
+  readonly storageDir: string
   tool: ToolDefinition | undefined
 
   readonly context = {
+    get: () => undefined,
     logger: loggerMock,
     sessions: {
       get: (id: string) => this.sessionsById.get(id),
@@ -54,7 +59,8 @@ export class TestHarness {
   } as unknown as Context
 
   constructor(config: Config) {
-    apply(this.context, config)
+    this.storageDir = config.storageDir ?? mkdtempSync(join(tmpdir(), 'agent-budget-test-'))
+    apply(this.context, { ...config, storageDir: this.storageDir })
   }
 
   add(session: Session): Session {
@@ -111,6 +117,15 @@ export class TestHarness {
       agent: { session },
     } as never)
     return value as Record<string, unknown>
+  }
+
+  ledgerLines(): Record<string, unknown>[] {
+    const file = join(this.storageDir, 'ledger.jsonl')
+    if (!existsSync(file)) return []
+    return readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
   }
 }
 

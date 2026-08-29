@@ -2,7 +2,7 @@
 
 Shared token budgets for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 agent trees. A root agent, its one-shot and continuable subagents, and workflow
-descendants spend from one durable budget.
+descendants can spend from one durable budget.
 
 > **Status**: experimental, verified against DSH `0.1.0-rc.5`. The package is
 > not published to npm yet; it is developed as an open-source contribution to
@@ -10,9 +10,11 @@ descendants spend from one durable budget.
 
 ## Highlights
 
-- treats a whole **agent tree** as one budget account;
-- persists the budget ledger **inside the session log**, so it survives reloads
-  and can be replayed;
+- treats a whole **agent tree** as one budget account (`scope: tree`), or each
+  session independently (`scope: session`);
+- stores the ledger in a **plugin-owned sidecar** under `~/.dsh/agent-budget/`,
+  never in session logs, so uninstalling the plugin cannot break sessions;
+- keeps the ledger append-only, replayable, and recoverable;
 - gives the model itself a read-only `budget_status` tool, not just a human
   command;
 - has **no UI or external service** dependency and can be installed as a plain
@@ -61,11 +63,14 @@ The package declares `dsh.bundle`, so `dsh plugin` adds it to the profile's
       config:
         maxTokens: 200000
         missingUsage: exhaust
+        scope: tree
 ```
 
 `maxTokens` is required and must be a positive safe integer. `missingUsage`
 defaults to `exhaust`; set it to `ignore` only when a provider intentionally
-omits usage and you accept incomplete enforcement.
+omits usage and you accept incomplete enforcement. `scope` defaults to `tree`;
+set it to `session` for one independent budget per session. `storageDir` is
+optional and defaults to `~/.dsh/agent-budget/`.
 
 ## Export shape
 
@@ -84,29 +89,54 @@ used and remaining tokens, exhaustion state, all four usage buckets,
 
 ## Semantics
 
-- Only `origin: subagent` ancestry shares a budget. Ordinary sessions and
-  ordinary forks have independent ledgers.
+- With `scope: tree` (default), the plugin resolves the tree root using DSH's
+  **runtime agent ownership** first, falls back to the durable `parentSession`
+  chain, and finally falls back to an independent budget with a warning when
+  neither is available. It never merges unrelated sessions into one account.
+- With `scope: session`, every session has an independent budget, including
+  subagents.
 - Every `llm/stream` call with a `sessionId` is included: conversation,
   subagent, workflow, compaction, and title-generation calls.
 - Uncached input, cache reads, cache writes, and output are disjoint buckets.
   Reasoning tokens are already part of output and are not added again.
-- The limit is captured by the root session's first `budget/open` event. A
-  later plugin reload does not mutate an existing budget.
+- The limit is captured by a scope's first open ledger record. A later plugin
+  reload does not mutate an existing budget.
 - Calls admitted concurrently may finish above the limit. Once settled usage
   reaches the limit, later calls fail before provider dispatch with
   `TOKEN_BUDGET_EXHAUSTED`.
 - Calls without a `sessionId` are outside any agent tree and are not metered.
 
-## Persistence compatibility
+## Storage and uninstall
 
-DSH `0.1.0-rc.5` accepts merge-extended session events but does not yet expose
-the event-envelope `ignorable` flag through `Session.append()`. This plugin
-registers its three event types in the runtime's exported known-event set so
-resume works when the plugin is loaded. Load the plugin before opening sessions
-that contain its ledger. A DSH reader without this plugin will reject those
-sessions rather than silently discard budget state. This compatibility bridge
-can be removed when DSH exposes first-class custom event registration or an
-ignorable append option.
+The plugin stores its ledger in:
+
+```text
+~/.dsh/agent-budget/
+  ledger.jsonl         append-only ledger (open/sample/unmetered)
+  scope-index.json     sessionId -> scopeKey index
+```
+
+- New versions **never write `budget/*` events into session logs**.
+- After uninstalling the plugin, DSH can open every session normally.
+- To fully remove budget data, delete `~/.dsh/agent-budget/`.
+
+## Migrating legacy session logs
+
+Versions before this sidecar design wrote `budget/*` events into session logs.
+Migrate them with:
+
+```bash
+node scripts/migrate-session-log.mjs
+```
+
+The migration tool:
+
+1. scans `~/.dsh/sessions/**/session.jsonl(.zstd)`;
+2. converts `budget/*` events into `ledger.jsonl` and `scope-index.json`;
+3. removes those events from each session log;
+4. creates a `.bak` backup before writing.
+
+Stop DSH processes that use the affected profile before running it.
 
 ## Known Limitations
 
@@ -114,11 +144,12 @@ ignorable append option.
   globally and swallows any error carrying that code. Today only this plugin
   produces it; if another plugin ever reuses the code, this boundary needs to
   be tightened.
-- Load the plugin before opening sessions that contain budget ledger events,
-  otherwise a DSH reader without it will reject those sessions.
-- Verified against DSH `0.1.0-rc.5`. When upgrading DSH, re-check: session
-  event registration, the `llm/stream` hook signature, and the
-  `agent/request-error` payload shape.
+- `scope: tree` may fall back to an independent budget in extreme cold-start
+  cases when no parent can be resolved. This prefers under-sharing over
+  incorrectly locking unrelated chats together.
+- Verified against DSH `0.1.0-rc.5`. When upgrading DSH, re-check: the
+  `llm/stream` hook signature, the `agent/request-error` payload shape, and the
+  `ctx.agents` runtime ownership API.
 - Concurrent admission can overshoot the limit by design (see Semantics).
 - Metering is fail-closed by default: providers that intentionally omit usage
   need `missingUsage: 'ignore'`.
@@ -126,12 +157,12 @@ ignorable append option.
 ## Repository layout
 
 ```text
-src/index.ts            plugin implementation
-tests/                  unit + integration tests (deterministic mock streams)
-cordis.patch.yml        default bundle layer for dsh plugin profiles
-scripts/                lint, test, and pack verification helpers
-docs/design.md          design decisions and compatibility notes
-.github/workflows/ci.yml CI on Node.js 22 and 24
+src/index.ts                    plugin implementation
+tests/                          unit + integration tests (deterministic mock streams)
+cordis.patch.yml                default bundle layer for dsh plugin profiles
+scripts/                        lint, test, pack verification, legacy migration
+docs/design.md                  design decisions and compatibility notes
+.github/workflows/ci.yml        CI on Node.js 22 and 24
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.

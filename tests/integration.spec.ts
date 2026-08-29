@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
@@ -22,12 +25,13 @@ class MockAdapter extends LlmAdapter {
 
 describe('DSH runtime integration', () => {
   it('wraps a real LlmRuntime stream and unregisters on plugin disposal', async () => {
+    const storageDir = mkdtempSync(join(tmpdir(), 'agent-budget-integration-'))
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    const fiber = ctx.plugin({ name, inject, apply }, { maxTokens: 10 })
+    const fiber = ctx.plugin({ name, inject, apply }, { maxTokens: 10, storageDir })
     await fiber.await()
     const adapter = new MockAdapter()
     ctx.llm.registerAdapter(['mock'], adapter)
@@ -40,7 +44,7 @@ describe('DSH runtime integration', () => {
     }))
     expect(adapter.calls).toBe(1)
     expect(chunks).toHaveLength(2)
-    expect(session.events.some(event => event.type === 'budget/sample')).toBe(true)
+    expect(session.events.some(event => event.type.startsWith('budget/'))).toBe(false)
     expect(ctx.tools.get('budget_status')).toBeDefined()
 
     await fiber.dispose()

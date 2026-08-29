@@ -12,34 +12,61 @@ usage ledger.
 
 ## Scope
 
-- Only `origin: subagent` ancestry shares a budget.
-- Ordinary sessions and ordinary forks have independent ledgers.
+- `scope: tree` (default): a whole agent tree shares one budget.
+- `scope: session`: every session is an independent budget account.
 - Every `llm/stream` call with a `sessionId` is included: conversation,
   subagent, workflow, compaction, and title-generation calls.
 - Calls without a `sessionId` are outside any agent tree and are not metered.
 
-## Ledger events
+## Scope resolution
 
-The budget is stored as three custom session events on the root session:
+The plugin does not infer the tree root solely from live session headers.
+Resolution order:
 
-- `budget/open`
-  - version, rootSessionId, epochId, limitTokens
-  - Created once, by the first metered call in a root session. The limit is
-    fixed at this point; later plugin reloads cannot change it.
-- `budget/sample`
-  - version, rootSessionId, epochId, callId, sessionId, provider, model,
-    purpose, and four usage buckets.
-  - Appended when a stream emits a provider `usage` chunk.
-- `budget/unmetered`
-  - version, rootSessionId, epochId, callId, sessionId, provider, model,
-    purpose.
-  - Appended when a stream completes with meaningful output but no provider
-    usage, or when usage cannot be validated.
+1. A persisted `scope-index.json` entry for `sessionId`, if present.
+2. DSH runtime agent ownership (`ctx.agents`): walk the live creator-owner
+   chain to the top-level agent.
+3. Durable `parentSession` lineage when the parent is live in `ctx.sessions`.
+4. Fallback: treat the session as its own budget scope and log a warning.
 
-The root session is resolved by walking parent links until a session with
-`origin !== 'subagent'` is found. The ledger is folded deterministically from
-the root session's event log, so the in-memory state can be rebuilt after a
-reload.
+The fallback intentionally under-shares. A wrong shared root is much more
+dangerous than a temporarily independent budget: it can lock unrelated chats
+together.
+
+## Ledger storage
+
+The budget is stored in a plugin-owned sidecar, not in session logs:
+
+```text
+~/.dsh/agent-budget/
+  ledger.jsonl         append-only ledger
+  scope-index.json     sessionId -> scopeKey
+```
+
+Ledger lines:
+
+- `open`
+  - version, scopeKey, epochId, limitTokens
+  - Created once per scope. The limit is fixed at this point; later plugin
+    reloads cannot change it.
+- `sample`
+  - version, scopeKey, callId, sessionId, provider, model, purpose, and four
+    usage buckets.
+- `unmetered`
+  - version, scopeKey, callId, sessionId, provider, model, purpose.
+
+The ledger is folded deterministically from the append-only file, so in-memory
+state can be rebuilt after a reload.
+
+## Why not session-log events
+
+DSH `0.1.0-rc.5` accepts merge-extended session events but does not expose the
+event-envelope `ignorable` flag through `Session.append()`. Writing plugin
+events into session logs makes sessions unreadable when the plugin is removed.
+The sidecar avoids that trap entirely while preserving replayability.
+
+Old logs that already contain `budget/*` events are migrated by
+`scripts/migrate-session-log.mjs`.
 
 ## Accounting model
 
@@ -50,9 +77,9 @@ Usage is split into four disjoint buckets:
 - `cacheWriteTokens`
 - `outputTokens` — includes reasoning tokens; reasoning is not double-counted
 
-The total is the sum of all buckets. A `budget/sample` event replaces any
-previous sample with the same `callId`; the state is always a fold of the
-event log rather than a mutable counter.
+The total is the sum of all buckets. A `sample` line replaces any previous
+sample with the same `callId`; the state is always a fold of the ledger rather
+than a mutable counter.
 
 ## Admission behavior
 
@@ -77,28 +104,16 @@ The plugin registers one read-only tool:
 
 The model can use this tool to self-regulate its remaining token budget.
 
-## DSH compatibility bridge
-
-DSH `0.1.0-rc.5` accepts merge-extended session events but does not expose the
-event-envelope `ignorable` flag through `Session.append()`. This plugin registers
-its three event types in the runtime's exported known-event set so resume works
-when the plugin is loaded.
-
-**Important**: load the plugin before opening sessions that contain budget
-ledger events. A DSH reader without this plugin will reject those sessions
-rather than silently discard budget state.
-
-When DSH exposes first-class custom event registration or an ignorable append
-option, this compatibility bridge can be removed.
-
 ## Known limitations
 
 - The `agent/request-error` handler matches
   `failure.code === 'TOKEN_BUDGET_EXHAUSTED'` globally and swallows any error
   carrying that code. Today only this plugin produces it; if another plugin
   reuses the code, the boundary must be tightened.
+- `scope: tree` may fall back to independent budgets in extreme cold-start
+  cases. This is intentional: under-sharing is safer than over-sharing.
 - Concurrent admission can overshoot the limit by design.
 - Metering is fail-closed by default.
-- Verified against DSH `0.1.0-rc.5`; when upgrading DSH, re-check session event
-  registration, the `llm/stream` hook signature, and the
-  `agent/request-error` payload shape.
+- Verified against DSH `0.1.0-rc.5`; when upgrading DSH, re-check the
+  `llm/stream` hook signature, the `agent/request-error` payload shape, and the
+  `ctx.agents` runtime ownership API.

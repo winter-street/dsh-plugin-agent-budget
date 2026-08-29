@@ -77,8 +77,10 @@ try {
   }
   const report = readFileSync(packJsonPath, 'utf8')
   // `npm pack` may run the package `prepare` script before printing its JSON
-  // report, so the file can contain build logs ahead of the JSON array.
-  const jsonStart = report.indexOf('[')
+  // report, so the file can contain build logs ahead of the JSON array. Build
+  // logs can include ANSI color codes such as "[34m", so find the JSON array by
+  // its actual shape (`[` followed by an object) instead of the first `[`.
+  const jsonStart = report.search(/\[\s*\{/)
   if (jsonStart === -1) throw new Error('npm pack produced no JSON report')
   const packed = JSON.parse(report.slice(jsonStart))[0]
   if (!packed?.filename) throw new Error('npm pack did not report an archive')

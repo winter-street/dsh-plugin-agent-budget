@@ -27,8 +27,7 @@ jobs:
       - run: pnpm run lint
       - run: pnpm run test
       - run: pnpm run build
-      # CI checks pack contents and publint. The optional consumer-install
-      # verification (PACK_INSTALL=1) is left for local/release runs because it
-      # performs a fresh npm install in an isolated consumer directory.
       - if: matrix.node == 22
         run: pnpm run pack:check
+        env:
+          PACK_INSTALL: 1

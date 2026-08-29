@@ -23,7 +23,8 @@ describe('plugin surface and config', () => {
   )
 
   it('rejects unknown direct-call config keys', () => {
-    expect(() => new TestHarness({ maxTokens: 10, typo: true } as never)).toThrow('unknown config key')
+    expect(() => apply({} as never, { maxTokens: 10, typo: true } as never))
+      .toThrow('unknown config key')
   })
 })
 

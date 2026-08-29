@@ -60,7 +60,12 @@ export class TestHarness {
 
   constructor(config: Config) {
     this.storageDir = config.storageDir ?? mkdtempSync(join(tmpdir(), 'agent-budget-test-'))
-    apply(this.context, { ...config, storageDir: this.storageDir })
+    apply(this.context, {
+      maxTokens: config.maxTokens,
+      ...config.missingUsage === undefined ? {} : { missingUsage: config.missingUsage },
+      ...config.scope === undefined ? {} : { scope: config.scope },
+      storageDir: this.storageDir,
+    })
   }
 
   add(session: Session): Session {

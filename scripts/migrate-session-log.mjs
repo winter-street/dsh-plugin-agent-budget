@@ -125,9 +125,20 @@ function readSessionLines(file) {
 }
 
 function writeSessionLines(file, lines) {
-  const text = `${lines.join('\n')}\n`
-  if (file.endsWith('.zstd')) writeFileSync(file, compressZstd(text))
-  else writeFileSync(file, text, 'utf8')
+  if (!file.endsWith('.zstd')) {
+    writeFileSync(file, `${lines.join('\n')}\n`, 'utf8')
+    return
+  }
+  // DSH requires the first zstd frame to contain exactly the header line;
+  // event lines go in a separate frame. A single-frame write would make the
+  // session unreadable at startup ("first frame is not exactly one header line").
+  const [header, ...events] = lines
+  if (header === undefined) throw new Error(`empty session log: ${file}`)
+  const frames = [compressZstd(`${header}\n`)]
+  if (events.length > 0) {
+    frames.push(compressZstd(`${events.join('\n')}\n`))
+  }
+  writeFileSync(file, Buffer.concat(frames))
 }
 
 function ledgerLineFor(event) {

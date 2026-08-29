@@ -8,8 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
-import { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
-import type { AgentRegistry } from '@deepseek-ai/dsh-agent'
+import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'agent-budget'
@@ -439,7 +438,7 @@ function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
 }
 
 function runtimeRoot(ctx: Context, sessionId: string): string | undefined {
-  const agents = ctx.get('agents') as AgentRegistry | undefined
+  const agents = ctx.get('agents')
   if (agents === undefined) return undefined
   const live = agents.list()
   if (live.length === 0) return undefined
@@ -454,7 +453,7 @@ function runtimeRoot(ctx: Context, sessionId: string): string | undefined {
       }
     }
   }
-  const agent = agents.get(sessionId as never)
+  const agent = agents.get(SessionId(sessionId))
   if (agent === undefined) return undefined
   const visited = new Set<string>()
   let current: { session: { id: string } } | undefined = agent
@@ -470,7 +469,7 @@ function runtimeRoot(ctx: Context, sessionId: string): string | undefined {
 }
 
 function durableRoot(ctx: Context, sessionId: string): string | undefined {
-  const first = ctx.sessions.get(sessionId as never)
+  const first = ctx.sessions.get(SessionId(sessionId))
   if (first === undefined) return undefined
   const visited = new Set<string>()
   let current = first

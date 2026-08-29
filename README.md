@@ -28,7 +28,12 @@ per-turn limits to more specialized plugins.
 
 ## Install
 
-Install as a bundle into a profile (recommended):
+> The package is not published to npm yet. The commands below assume the
+> package is available in your profile workspace (for example via a local
+> checkout with `dsh plugin --profile <name> add -w .`, or from a GitHub
+> bundle once this repository is public).
+
+Install as a bundle into a profile (recommended after publishing):
 
 ```bash
 dsh plugin --profile <name> add dsh-plugin-agent-budget

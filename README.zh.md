@@ -22,7 +22,10 @@ Token 预算插件。根 Agent、one-shot/continuable subagent 以及 workflow �
 
 ## 安装
 
-作为 bundle 安装到 profile（推荐）：
+> 目前尚未发布到 npm。下面的命令默认包已存在于 profile workspace 中（例如通过本地
+> checkout 使用 `dsh plugin --profile <name> add -w .`，或等仓库公开后从 GitHub bundle 安装）。
+
+作为 bundle 安装到 profile（推荐，发布后可用）：
 
 ```bash
 dsh plugin --profile <name> add dsh-plugin-agent-budget

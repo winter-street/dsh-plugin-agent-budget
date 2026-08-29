@@ -1,0 +1,6 @@
+- insert:
+    - id: agent-budget
+      name: dsh-plugin-agent-budget
+      config:
+        maxTokens: 200000
+        missingUsage: exhaust

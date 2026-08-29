@@ -1,0 +1,11 @@
+node_modules/
+lib/
+coverage/
+*.tgz
+.artifacts/
+.env
+.pnpm-store/
+.npm-cache-workspace/
+.dsh-home-test/
+*.tsbuildinfo
+

@@ -19,8 +19,9 @@ describe('budget adjust and reset ledger semantics', () => {
     expect(await harness.status(root)).toMatchObject({ limitTokens: 50, usedTokens: 35 })
 
     const types = harness.ledgerLines().map(line => line.type)
-    expect(types).toEqual(['open', 'sample', 'adjust'])
+    expect(types).toEqual(['open', 'start', 'sample', 'end', 'adjust'])
 
+    harness.dispose()
     const replay = new TestHarness({ maxTokens: 999, storageDir: harness.storageDir })
     const resumed = replay.resume(root)
     expect(await replay.status(resumed)).toMatchObject({ limitTokens: 50, usedTokens: 35 })
@@ -48,6 +49,7 @@ describe('budget adjust and reset ledger semantics', () => {
 
     expect(harness.ledgerLines().filter(line => line.type === 'reset')).toHaveLength(1)
 
+    harness.dispose()
     const replay = new TestHarness({ maxTokens: 999, storageDir: harness.storageDir })
     const resumed = replay.resume(root)
     expect(await replay.status(resumed)).toMatchObject({ limitTokens: 200, usedTokens: 0 })

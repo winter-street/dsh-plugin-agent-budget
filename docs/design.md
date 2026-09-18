@@ -23,9 +23,9 @@ usage ledger.
 The plugin does not infer the tree root solely from live session headers.
 Resolution order:
 
-1. A persisted `scope-index.json` entry for `sessionId`, if present.
-2. DSH runtime agent ownership (`ctx.agents`): walk the live creator-owner
+1. DSH runtime agent ownership (`ctx.agents`): walk the live creator-owner
    chain to the top-level agent.
+2. A persisted `scope-index.json` entry for `sessionId`, if present.
 3. Durable `parentSession` lineage when the parent is live in `ctx.sessions`.
 4. Fallback: treat the session as its own budget scope and log a warning.
 
@@ -54,9 +54,22 @@ Ledger lines:
     usage buckets.
 - `unmetered`
   - version, scopeKey, callId, sessionId, provider, model, purpose.
+- `start` / `end`
+  - version, scopeKey, callId. Persisted before dispatch and after settlement.
+  - Unfinished calls recovered at startup count as unmetered. Live concurrent
+    calls are excluded from this recovery rule.
+- `adjust` / `reset`
+  - Override a limit or clear settled and unknown usage. Reset is rejected
+    while a call is active in that scope.
 
 The ledger is folded deterministically from the append-only file, so in-memory
 state can be rebuilt after a reload.
+
+The runtime and migration share an exclusive `writer.lock`. Append failures
+close admission until restart. Corrupt records and indexes fail startup rather
+than dropping accounting. Replacement samples are validated against a copy of
+the current totals before writing, including overflow across all buckets.
+See [SECURITY.md](../SECURITY.md) for recovery and downgrade restrictions.
 
 ## Why not session-log events
 
@@ -106,7 +119,7 @@ The model can use this tool to self-regulate its remaining token budget.
 
 ## Settings panel and HTTP API
 
-The plugin registers a `settings.section` web panel and a prefix HTTP route at
+The plugin registers a `settings.section` web panel and an optional prefix HTTP route at
 `/agent-budget/api`.
 
 - `GET /scopes` returns every open budget scope with its current status.
@@ -116,12 +129,17 @@ The plugin registers a `settings.section` web panel and a prefix HTTP route at
 Both operations keep the ledger append-only. Replaying `ledger.jsonl` yields
 the same state as incremental application.
 
+The API admits loopback peers with a local Host only; checks Origin and Fetch
+Metadata; and requires an explicit request header plus JSON content type for
+mutations. It does not authenticate remote users. Bodies are bounded to 16 KiB.
+
+The client keeps load errors separate from mutation errors, rejects invalid
+numeric limits, synchronizes server updates, and ignores stale fetch results.
+
 ## Known limitations
 
-- The `agent/request-error` handler matches
-  `failure.code === 'TOKEN_BUDGET_EXHAUSTED'` globally and swallows any error
-  carrying that code. Today only this plugin produces it; if another plugin
-  reuses the code, the boundary must be tightened.
+- The `agent/request-error` handler requires both the budget error code and a
+  recorded denial for the affected session. Producers should keep codes unique.
 - `scope: tree` may fall back to independent budgets in extreme cold-start
   cases. This is intentional: under-sharing is safer than over-sharing.
 - One `storageDir` supports one DSH process at a time. Concurrent `headless`
@@ -129,6 +147,6 @@ the same state as incremental application.
   to the ledger.
 - Concurrent admission can overshoot the limit by design.
 - Metering is fail-closed by default.
-- Verified against DSH `0.1.0-rc.5`; when upgrading DSH, re-check the
+- Verified against DSH `0.1.0-rc.6`; when upgrading DSH, re-check the
   `llm/stream` hook signature, the `agent/request-error` payload shape, and the
   `ctx.agents` runtime ownership API.

@@ -37,12 +37,12 @@ pnpm check
 Please read [docs/design.md](docs/design.md) before changing behavior. The most
 important invariants are:
 
-- The ledger must be a pure fold of session events, so it stays replayable.
-- `budget/open` must remain fixed after the first metered call in a root
-  session.
+- The ledger must be a pure fold of plugin-owned sidecar records, so it stays replayable.
+- `open` captures the initial limit; only an explicit `adjust` may change it.
 - Unknown or invalid provider usage must fail closed by default.
-- The plugin should stay self-contained: no UI, no external service, no
-  mandatory cost/carbon features.
+- The plugin should stay self-contained: an optional settings panel, no external
+  service, and no mandatory cost/carbon features.
+- Maintain the local administration boundary and the shared writer lock.
 
 ## Pull request checklist
 

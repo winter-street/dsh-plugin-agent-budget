@@ -4,7 +4,7 @@
 Token 预算插件。根 Agent、one-shot/continuable subagent 以及 workflow 后代可以共同消耗一份
 可持久化预算。
 
-> **状态**：实验性，已验证 DSH `0.1.0-rc.5`。目前尚未发布到 npm，作为 DSH 插件生态的
+> **状态**：实验性，已验证 DSH `0.1.0-rc.6`。目前尚未发布到 npm，作为 DSH 插件生态的
 > 开源贡献持续开发中。
 
 ## 亮点
@@ -69,7 +69,7 @@ allowBuilds:
 插件导出四个命名成员，**没有默认导出**：
 
 - `name: 'agent-budget'`
-- `inject: ['llm', 'sessions', 'tools']`
+- `inject: ['llm', 'sessions', 'tools', 'agents']`（Web 服务为可选依赖）
 - `apply(ctx, config)` — 函数插件入口
 - `Config` — loader 配置 schema
 
@@ -84,6 +84,11 @@ Web client 会在设置页注册 `Token 预算` 面板：列出所有已开启�
 展示 limit/used/remaining/exhausted 与进度条，每 30 秒轮询刷新。
 
 Host HTTP API 位于 `/agent-budget/api`：
+
+0.3.0 起仅允许本机回环连接，并校验 Host/Origin。POST 必须携带
+`Content-Type: application/json` 和 `X-Agent-Budget-Request: 1`，请求体上限为
+16 KiB。执行中的 scope 不能重置，返回 HTTP 409。内置设置页已适配。
+不要通过公共反向代理暴露此接口。访问边界和故障恢复见 [SECURITY.md](SECURITY.md)。
 
 - `GET /scopes` → `{ ok, scopes: [{ scopeKey, limitTokens, usedTokens, ... }] }`
 - `POST /adjust-limit`，body `{ scopeKey, limitTokens }` → 覆盖该 scope 的上限
@@ -113,8 +118,9 @@ Host HTTP API 位于 `/agent-budget/api`：
 
 ```text
 ~/.dsh/agent-budget/
-  ledger.jsonl         append-only 账本（open/sample/unmetered）
+  ledger.jsonl         append-only 账本（含 start/end 调用记录）
   scope-index.json     sessionId -> scopeKey 索引
+  writer.lock          独占写入锁
 ```
 
 - 新版本**不再向 Session 日志写入任何 `budget/*` 事件**；
@@ -122,6 +128,9 @@ Host HTTP API 位于 `/agent-budget/api`：
 - 彻底清除预算数据，删除 `~/.dsh/agent-budget/` 即可；
 - 同一个 `storageDir` 同一时间只应由一个 DSH 进程使用。若 `headless` 与
   `web` 同时运行，请为不同 profile 配置不同的 `storageDir`，或避免同时写同一账本。
+- 0.3.0 使用独占锁拒绝并发写入。崩溃后须确认所有写入进程已停止，再删除遗留锁文件。
+- 损坏的账本和索引会阻止启动；升级前备份整个目录，不要用旧版插件打开 0.3.0 写入的数据。
+- 取消、流异常及进程崩溃导致用量无法完整确认时，默认按未计量调用阻止继续调用。
 
 ## 旧数据迁移
 
@@ -142,11 +151,9 @@ node scripts/migrate-session-log.mjs
 
 ## 已知限制（Known Limitations）
 
-- `agent/request-error` 拦截按 `failure.code === 'TOKEN_BUDGET_EXHAUSTED'` 全局生效，
-  任何来源抛出该 code 的错误都会被静默吞掉。当前只有本插件会产生该 code；若未来其他
-  插件复用该 code，需要收紧这里的边界。
+- 错误处理只终止本插件确实拒绝过的会话的预算错误；各插件仍应保持错误码唯一。
 - `scope: tree` 在极端冷启动且 parent 不可解析时会退化为独立预算，宁可少共享，也不误锁。
-- 与 DSH `0.1.0-rc.5` 验证；升级 DSH 时请重点回归：`llm/stream` 钩子签名、
+- 与 DSH `0.1.0-rc.6` 验证；升级 DSH 时请重点回归：`llm/stream` 钩子签名、
   `agent/request-error` 载荷结构、`ctx.agents` 的 runtime ownership API。
 - 并发准入可能造成有限超额，这是设计取舍（README 语义已声明）。
 - 计量不完整时默认 fail-closed：明确不返回 usage 的 provider 请配置

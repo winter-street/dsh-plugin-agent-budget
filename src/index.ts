@@ -1,7 +1,7 @@
 /** Shared, replayable token budgets for one DSH agent tree. */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -11,21 +11,23 @@ import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { authorizeRequest, HttpError, readJsonBody, sendJson } from './http.ts'
+import { acquireStorageLock, writeAtomic } from '../scripts/storage.mjs'
 
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    webServer: {
-      register(route: {
-        kind: 'prefix'
-        path: string
-        handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
-      }): () => void
-    }
-  }
+interface BudgetWebServer {
+  register(route: {
+    kind: 'prefix'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }): () => void
+}
+
+function isWebServer(value: unknown): value is BudgetWebServer {
+  return isRecord(value) && typeof value.register === 'function'
 }
 
 export const name = 'agent-budget'
-export const inject = ['llm', 'sessions', 'tools', 'agents', 'webServer']
+export const inject = ['llm', 'sessions', 'tools', 'agents']
 
 const EVENT_VERSION = 1 as const
 const EXHAUSTED_CODE = 'TOKEN_BUDGET_EXHAUSTED'
@@ -102,6 +104,12 @@ export const Config: z<Config> = z.object({
 /** One append-only ledger line in the plugin-owned sidecar store. */
 type LedgerLine =
   | {
+    type: 'start' | 'end'
+    version: typeof EVENT_VERSION
+    scopeKey: string
+    callId: string
+  }
+  | {
     type: 'open'
     version: typeof EVENT_VERSION
     scopeKey: string
@@ -145,6 +153,7 @@ interface LedgerState {
   open: LedgerOpen | undefined
   samples: Map<string, UsageBuckets>
   unmetered: Set<string>
+  pending: Set<string>
   usage: UsageBuckets
 }
 
@@ -217,7 +226,7 @@ function validateConfig(config: Config): {
     throw new TypeError('agent-budget: scope must be "session" or "tree"')
   }
   const storageDir = config.storageDir ?? defaultStorageDir()
-  if (storageDir.length === 0) {
+  if (typeof storageDir !== 'string' || storageDir.trim().length === 0 || storageDir.includes('\0')) {
     throw new TypeError('agent-budget: storageDir must be a non-empty path')
   }
   return { missingUsage, scope, storageDir }
@@ -228,6 +237,7 @@ function emptyState(): LedgerState {
     open: undefined,
     samples: new Map(),
     unmetered: new Set(),
+    pending: new Set(),
     usage: { ...ZERO_USAGE },
   }
 }
@@ -241,7 +251,11 @@ function createOwnershipCache(): OwnershipCache {
 }
 
 function total(usage: UsageBuckets): number {
-  return usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens + usage.outputTokens
+  const value = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens + usage.outputTokens
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('agent-budget: usage total is outside the safe integer range')
+  }
+  return value
 }
 
 function add(target: UsageBuckets, usage: UsageBuckets, sign: 1 | -1): void {
@@ -254,6 +268,7 @@ function add(target: UsageBuckets, usage: UsageBuckets, sign: 1 | -1): void {
   if (Object.values(next).some(value => !Number.isSafeInteger(value) || value < 0)) {
     throw new Error('agent-budget: usage total is outside the safe integer range')
   }
+  total(next)
   Object.assign(target, next)
 }
 
@@ -269,6 +284,7 @@ function bucketsOf(usage: TokenUsage): UsageBuckets {
       throw new TypeError(`agent-budget: usage.${bucket} must be a non-negative safe integer`)
     }
   }
+  total(buckets)
   return buckets
 }
 
@@ -307,6 +323,7 @@ function isLedgerLine(value: unknown): value is LedgerLine {
     return false
   }
   if (!nonEmptyString(value.scopeKey)) return false
+  if (value.type === 'start' || value.type === 'end') return nonEmptyString(value.callId)
   if (value.type === 'open') {
     return nonEmptyString(value.epochId)
       && typeof value.limitTokens === 'number'
@@ -314,6 +331,13 @@ function isLedgerLine(value: unknown): value is LedgerLine {
       && value.limitTokens > 0
   }
   if (value.type === 'sample' || value.type === 'unmetered') {
+    if (value.type === 'sample') {
+      if (!isRecord(value.usage)) return false
+      const usage = value.usage
+      const buckets = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens']
+      if (buckets.some(key => typeof usage[key] !== 'number'
+        || !Number.isSafeInteger(usage[key]) || usage[key] < 0)) return false
+    }
     return nonEmptyString(value.callId)
       && nonEmptyString(value.sessionId)
       && nonEmptyString(value.provider)
@@ -334,7 +358,7 @@ function isLedgerLine(value: unknown): value is LedgerLine {
 }
 
 function foldLedgerLine(scopeKey: string, state: LedgerState, line: LedgerLine): void {
-  if (line.scopeKey !== scopeKey) return
+  if (line.scopeKey !== scopeKey) throw new Error('agent-budget: mismatched scope')
   if (line.type === 'open') {
     if (state.open === undefined) {
       state.open = {
@@ -347,17 +371,27 @@ function foldLedgerLine(scopeKey: string, state: LedgerState, line: LedgerLine):
     return
   }
   const ledgerOpen = state.open
-  if (ledgerOpen === undefined) return
+  if (ledgerOpen === undefined) throw new Error('agent-budget: ledger event precedes open')
+  if (line.type === 'start') {
+    state.pending.add(line.callId)
+    return
+  }
+  if (line.type === 'end') {
+    state.pending.delete(line.callId)
+    return
+  }
   if (line.type === 'sample') {
+    const next = { ...state.usage }
     const previous = state.samples.get(line.callId)
-    if (previous !== undefined) add(state.usage, previous, -1)
+    if (previous !== undefined) add(next, previous, -1)
+    add(next, line.usage, 1)
     state.samples.set(line.callId, line.usage)
     state.unmetered.delete(line.callId)
-    add(state.usage, line.usage, 1)
+    state.usage = next
     return
   }
   if (line.type === 'unmetered') {
-    if (!state.samples.has(line.callId)) state.unmetered.add(line.callId)
+    state.unmetered.add(line.callId)
     return
   }
   if (line.type === 'adjust') {
@@ -367,6 +401,7 @@ function foldLedgerLine(scopeKey: string, state: LedgerState, line: LedgerLine):
   if (line.type === 'reset') {
     state.samples.clear()
     state.unmetered.clear()
+    state.pending.clear()
     state.usage = { ...ZERO_USAGE }
   }
 }
@@ -376,16 +411,16 @@ function ensureDir(dir: string): void {
 }
 
 function writeJsonAtomic(file: string, value: unknown): void {
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
-  renameSync(tmp, file)
+  writeAtomic(file, `${JSON.stringify(value, null, 2)}\n`)
 }
 
 function appendLedgerLine(file: string, line: LedgerLine): void {
-  appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8')
+  appendFileSync(file, `${JSON.stringify(line)}\n`, { encoding: 'utf8', mode: 0o600, flush: true })
 }
 
 class LedgerStore {
+  failed = false
+  readonly activeCallIds = new Set<string>()
   private readonly ledgerPath: string
   private readonly indexPath: string
   readonly states = new Map<string, LedgerState>()
@@ -396,34 +431,41 @@ class LedgerStore {
     this.indexPath = join(dir, 'scope-index.json')
   }
 
+  append(line: LedgerLine): void {
+    if (this.failed) throw new Error('agent-budget: storage failed; repair and restart before continuing')
+    try {
+      appendLedgerLine(this.ledgerPath, line)
+    } catch (error) {
+      this.failed = true
+      throw error
+    }
+  }
+
   load(): void {
     ensureDir(this.dir)
     if (existsSync(this.indexPath)) {
       try {
         const parsed = JSON.parse(readFileSync(this.indexPath, 'utf8')) as unknown
-        if (isRecord(parsed)) {
-          for (const [sessionId, scopeKey] of Object.entries(parsed)) {
-            if (nonEmptyString(sessionId) && nonEmptyString(scopeKey)) {
-              this.scopeIndex.set(sessionId, scopeKey)
-            }
-          }
+        if (!isRecord(parsed)) throw new Error('invalid index')
+        for (const [sessionId, scopeKey] of Object.entries(parsed)) {
+          if (!nonEmptyString(sessionId) || !nonEmptyString(scopeKey)) throw new Error('invalid index entry')
+          this.scopeIndex.set(sessionId, scopeKey)
         }
       } catch {
-        // A corrupt index is not fatal: runtime ownership can rebuild it.
+        throw new Error('agent-budget: invalid scope index; restore or repair it before restarting')
       }
     }
     if (existsSync(this.ledgerPath)) {
       const lines = readFileSync(this.ledgerPath, 'utf8').split(/\r?\n/)
-      for (const raw of lines) {
+      for (const [index, raw] of lines.entries()) {
         if (raw.length === 0) continue
         let parsed: unknown
         try {
           parsed = JSON.parse(raw) as unknown
         } catch {
-          // Tolerate a torn final line after a crash.
-          continue
+          throw new Error(`agent-budget: malformed ledger JSON at line ${index + 1}; restore or repair the ledger before restarting`)
         }
-        if (!isLedgerLine(parsed)) continue
+        if (!isLedgerLine(parsed)) throw new Error(`agent-budget: invalid ledger record at line ${index + 1}`)
         let state = this.states.get(parsed.scopeKey)
         if (state === undefined) {
           state = emptyState()
@@ -431,6 +473,8 @@ class LedgerStore {
         }
         foldLedgerLine(parsed.scopeKey, state, parsed)
       }
+      // Preserve a complete record whose terminating newline was lost.
+      if (lines.at(-1) !== '') appendFileSync(this.ledgerPath, '\n', 'utf8')
     }
   }
 
@@ -449,8 +493,9 @@ class LedgerStore {
 
   bindSession(sessionId: string, scopeKey: string): void {
     if (this.scopeIndex.get(sessionId) === scopeKey) return
+    const next = new Map(this.scopeIndex).set(sessionId, scopeKey)
+    writeJsonAtomic(this.indexPath, Object.fromEntries(next))
     this.scopeIndex.set(sessionId, scopeKey)
-    writeJsonAtomic(this.indexPath, Object.fromEntries(this.scopeIndex))
   }
 
   appendOpen(scopeKey: string, epochId: string, limitTokens: number): void {
@@ -461,7 +506,7 @@ class LedgerStore {
       epochId,
       limitTokens,
     }
-    appendLedgerLine(this.ledgerPath, line)
+    this.append(line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
 
@@ -471,7 +516,12 @@ class LedgerStore {
       version: EVENT_VERSION,
       ...sample,
     }
-    appendLedgerLine(this.ledgerPath, line)
+    const current = this.state(scopeKey)
+    const next = { ...current.usage }
+    const previous = current.samples.get(line.callId)
+    if (previous !== undefined) add(next, previous, -1)
+    add(next, line.usage, 1)
+    this.append(line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
 
@@ -481,7 +531,7 @@ class LedgerStore {
       version: EVENT_VERSION,
       ...sample,
     }
-    appendLedgerLine(this.ledgerPath, line)
+    this.append(line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
 
@@ -492,7 +542,7 @@ class LedgerStore {
       scopeKey,
       limitTokens,
     }
-    appendLedgerLine(this.ledgerPath, line)
+    this.append(line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
 
@@ -502,7 +552,13 @@ class LedgerStore {
       version: EVENT_VERSION,
       scopeKey,
     }
-    appendLedgerLine(this.ledgerPath, line)
+    this.append(line)
+    foldLedgerLine(scopeKey, this.state(scopeKey), line)
+  }
+
+  appendCallBoundary(scopeKey: string, callId: string, type: 'start' | 'end'): void {
+    const line: LedgerLine = { type, version: EVENT_VERSION, scopeKey, callId }
+    this.append(line)
     foldLedgerLine(scopeKey, this.state(scopeKey), line)
   }
 }
@@ -640,27 +696,20 @@ function budgetStatus(
   const state = create ? openLedger(store, config, logger, scopeKey).state : store.state(scopeKey)
   const limitTokens = state.open?.limitTokens ?? config.maxTokens
   const usedTokens = total(state.usage)
-  const unmeteredCalls = state.unmetered.size
+  const unresolved = new Set(state.unmetered)
+  for (const callId of state.pending) {
+    if (!store.activeCallIds.has(callId)) unresolved.add(callId)
+  }
+  const unmeteredCalls = unresolved.size
   return {
     limitTokens,
     usedTokens,
     remainingTokens: Math.max(0, limitTokens - usedTokens),
-    exhausted: usedTokens >= limitTokens || (missingUsage === 'exhaust' && unmeteredCalls > 0),
+    exhausted: store.failed || usedTokens >= limitTokens || (missingUsage === 'exhaust' && unmeteredCalls > 0),
     usage: { ...state.usage },
     meteringComplete: unmeteredCalls === 0,
     unmeteredCalls,
   }
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(Buffer.from(chunk))
-  return Buffer.concat(chunks).toString('utf8')
-}
-
-function sendJson(res: ServerResponse, code: number, body: unknown): void {
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
 }
 
 function scopesOf(store: LedgerStore): string[] {
@@ -672,8 +721,25 @@ export function apply(ctx: Context, config: Config): void {
   const { missingUsage, scope, storageDir } = validateConfig(config)
   const logger = ctx.logger('agent-budget')
   const store = new LedgerStore(storageDir)
-  store.load()
+  let disposed = false
+  let releaseWriter: (() => void) | undefined
+  ctx.effect(() => {
+    const release = acquireStorageLock(storageDir)
+    try {
+      store.load()
+    } catch (error) {
+      release()
+      throw error
+    }
+    releaseWriter = release
+    return () => {
+      disposed = true
+      if (store.activeCallIds.size === 0) release()
+    }
+  }, 'agent-budget: storage writer')
   const ownershipCache = createOwnershipCache()
+  const activeCalls = new Map<string, number>()
+  const deniedSessions = new Set<string>()
 
   // Old plugin versions wrote budget events into session logs. Keep the event
   // vocabulary registered so those logs remain readable while the migration
@@ -695,6 +761,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   ctx.on('llm/stream', (options, next) => {
+    if (disposed) throw new Error('agent-budget: plugin is disposed')
     if (options.sessionId === undefined) return next()
     const sessionId = String(options.sessionId)
     const purpose = purposeOf(options)
@@ -711,6 +778,7 @@ export function apply(ctx: Context, config: Config): void {
     const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger, ownershipCache)
     const before = createStatus(scopeKey, true)
     if (before.exhausted) {
+      deniedSessions.add(sessionId)
       logger.warn(
         'budget exhausted before provider dispatch: scope=%s limit=%d used=%d unmetered=%d',
         scopeKey,
@@ -720,6 +788,7 @@ export function apply(ctx: Context, config: Config): void {
       )
       return denial(before)
     }
+    deniedSessions.delete(sessionId)
 
     const callId = randomUUID()
     const subject = {
@@ -741,22 +810,34 @@ export function apply(ctx: Context, config: Config): void {
       store.appendUnmetered(scopeKey, subject)
     }
 
-    const stream = next()
     return (async function* (): AsyncGenerator<StreamChunk> {
-      let completed = false
+      if (disposed) throw new Error('agent-budget: plugin is disposed')
+      // Iteration can begin long after the hook returned its iterable.
+      const admission = createStatus(scopeKey, false)
+      if (admission.exhausted) {
+        deniedSessions.add(sessionId)
+        throw new TokenBudgetExhaustedError(admission)
+      }
+      store.appendCallBoundary(scopeKey, callId, 'start')
+      store.activeCallIds.add(callId)
+      activeCalls.set(scopeKey, (activeCalls.get(scopeKey) ?? 0) + 1)
       let sawUsage = false
       let meaningful = false
+      let markedUnmetered = false
+      let completed = false
+      let terminalFailure = false
       try {
-        for await (const chunk of stream) {
+        for await (const chunk of next()) {
           if (chunk.type === 'usage') {
             let usage: UsageBuckets
             try {
               usage = bucketsOf(chunk.usage)
+              store.appendSample(scopeKey, { ...subject, usage })
             } catch (error: unknown) {
               recordUnmetered()
+              markedUnmetered = true
               throw error
             }
-            store.appendSample(scopeKey, { ...subject, usage })
             logger.debug(
               'budget sample recorded: call=%s session=%s provider=%s model=%s input=%d cacheRead=%d cacheWrite=%d output=%d',
               callId,
@@ -773,22 +854,34 @@ export function apply(ctx: Context, config: Config): void {
             || (chunk.reason.kind !== 'error' && chunk.reason.kind !== 'aborted')) {
             meaningful = true
           }
+          if (chunk.type === 'finish') {
+            completed = true
+            terminalFailure = chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted'
+          }
           yield chunk
         }
         completed = true
       } finally {
-        if (completed && !sawUsage && meaningful) {
-          recordUnmetered()
+        const remaining = (activeCalls.get(scopeKey) ?? 1) - 1
+        if (remaining === 0) activeCalls.delete(scopeKey)
+        else activeCalls.set(scopeKey, remaining)
+        try {
+          if (!markedUnmetered && (!completed || (!sawUsage && (meaningful || !terminalFailure)))) {
+            recordUnmetered()
+          }
+          store.appendCallBoundary(scopeKey, callId, 'end')
+        } finally {
+          store.activeCallIds.delete(callId)
+          if (disposed && store.activeCallIds.size === 0) releaseWriter?.()
         }
       }
     })()
   })
 
-  // Intentionally global: today only this plugin produces TOKEN_BUDGET_EXHAUSTED.
-  // If another plugin reuses that code in the future, this boundary must be
-  // tightened so unrelated failures are not swallowed here.
   ctx.on('agent/request-error', (payload, next) => {
-    if (payload.failure.code === EXHAUSTED_CODE) return Promise.resolve(undefined)
+    if (payload.failure.code === EXHAUSTED_CODE && deniedSessions.delete(String(payload.agent.session.id))) {
+      return Promise.resolve(undefined)
+    }
     return next()
   })
 
@@ -838,11 +931,16 @@ export function apply(ctx: Context, config: Config): void {
     presentCall: () => ({ card: 'generic', title: 'Token budget status', kind: 'other' }),
   }))
 
-  ctx.effect(() => ctx.webServer.register({
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer: unknown = webCtx.get('webServer')
+    if (!isWebServer(webServer)) throw new Error('agent-budget: incompatible web server service')
+    webCtx.effect(() => webServer.register({
     kind: 'prefix',
     path: '/agent-budget/api',
     handler: async (req: IncomingMessage, res: ServerResponse) => {
       try {
+        if (disposed) throw new HttpError(503, 'budget service is stopping')
+        authorizeRequest(req)
         const url = new URL(req.url ?? '/', 'http://localhost')
         const path = url.pathname.replace(/^\/agent-budget\/api/, '') || '/'
         if (req.method === 'GET' && path === '/scopes') {
@@ -855,13 +953,14 @@ export function apply(ctx: Context, config: Config): void {
           return sendJson(res, 200, { ok: true, scopes })
         }
         if (req.method === 'POST' && path === '/adjust-limit') {
-          const body = JSON.parse(await readBody(req)) as Record<string, unknown>
-          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey.trim() : ''
+          const body = await readJsonBody(req)
+          if (disposed) throw new HttpError(503, 'budget service is stopping')
+          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey : ''
           const limitTokens = typeof body.limitTokens === 'number' ? body.limitTokens : Number.NaN
           if (scopeKey.length === 0 || !Number.isSafeInteger(limitTokens) || limitTokens < 1) {
             return sendJson(res, 400, { ok: false, error: 'scopeKey and a positive safe integer limitTokens are required' })
           }
-          if (store.state(scopeKey).open === undefined) {
+          if (store.states.get(scopeKey)?.open === undefined) {
             return sendJson(res, 404, { ok: false, error: `scope not found: ${scopeKey}` })
           }
           store.appendAdjust(scopeKey, limitTokens)
@@ -871,13 +970,17 @@ export function apply(ctx: Context, config: Config): void {
           })
         }
         if (req.method === 'POST' && path === '/reset') {
-          const body = JSON.parse(await readBody(req)) as Record<string, unknown>
-          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey.trim() : ''
+          const body = await readJsonBody(req)
+          if (disposed) throw new HttpError(503, 'budget service is stopping')
+          const scopeKey = typeof body.scopeKey === 'string' ? body.scopeKey : ''
           if (scopeKey.length === 0) {
             return sendJson(res, 400, { ok: false, error: 'scopeKey is required' })
           }
-          if (store.state(scopeKey).open === undefined) {
+          if (store.states.get(scopeKey)?.open === undefined) {
             return sendJson(res, 404, { ok: false, error: `scope not found: ${scopeKey}` })
+          }
+          if (activeCalls.has(scopeKey)) {
+            throw new HttpError(409, 'cannot reset a scope while model calls are active')
           }
           store.appendReset(scopeKey)
           return sendJson(res, 200, {
@@ -887,11 +990,13 @@ export function apply(ctx: Context, config: Config): void {
         }
         return sendJson(res, 404, { ok: false, error: `not found: ${path}` })
       } catch (error: unknown) {
-        return sendJson(res, 500, {
+        if (!(error instanceof HttpError)) logger.error('budget API request failed: %s', error)
+        return sendJson(res, error instanceof HttpError ? error.status : 500, {
           ok: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: error instanceof HttpError ? error.message : 'internal budget service error',
         })
       }
     },
-  }), 'agent-budget: settings-api')
+    }), 'agent-budget: settings-api')
+  })
 }

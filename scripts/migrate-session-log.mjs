@@ -19,17 +19,18 @@
 
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import {
+  constants as fsConstants,
   copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  writeFileSync,
   appendFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { acquireStorageLock, writeAtomic } from './storage.mjs'
 
 const EVENT_VERSION = 1
 const BUDGET_TYPES = new Set(['budget/open', 'budget/sample', 'budget/unmetered'])
@@ -110,7 +111,7 @@ function walkSessions(root) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name)
       if (entry.isDirectory()) visit(full)
-      else if (entry.name.endsWith('.jsonl') || entry.name.endsWith('.jsonl.zstd')) files.push(full)
+      else if (entry.isFile() && (entry.name.endsWith('.jsonl') || entry.name.endsWith('.jsonl.zstd'))) files.push(full)
     }
   }
   if (existsSync(root)) visit(root)
@@ -127,7 +128,7 @@ function readSessionLines(file) {
 
 function writeSessionLines(file, lines) {
   if (!file.endsWith('.zstd')) {
-    writeFileSync(file, `${lines.join('\n')}\n`, 'utf8')
+    writeAtomic(file, `${lines.join('\n')}\n`)
     return
   }
   // DSH requires the first zstd frame to contain exactly the header line;
@@ -139,12 +140,18 @@ function writeSessionLines(file, lines) {
   if (events.length > 0) {
     frames.push(compressZstd(`${events.join('\n')}\n`))
   }
-  writeFileSync(file, Buffer.concat(frames))
+  writeAtomic(file, Buffer.concat(frames))
 }
 
 function ledgerLineFor(event) {
   const data = event.data
+  if (!data || data.version !== EVENT_VERSION || typeof data.rootSessionId !== 'string' || !data.rootSessionId) {
+    throw new Error('invalid legacy budget event')
+  }
   if (event.type === 'budget/open') {
+    if (typeof data.epochId !== 'string' || !data.epochId || !Number.isSafeInteger(data.limitTokens) || data.limitTokens < 1) {
+      throw new Error('invalid legacy budget open')
+    }
     return {
       type: 'open',
       version: EVENT_VERSION,
@@ -153,7 +160,16 @@ function ledgerLineFor(event) {
       limitTokens: data.limitTokens,
     }
   }
+  if (['callId', 'sessionId', 'provider', 'model', 'epochId'].some(key => typeof data[key] !== 'string' || !data[key])
+    || !['conversation', 'compaction', 'session-title'].includes(data.purpose)) {
+    throw new Error('invalid legacy budget sample subject')
+  }
   if (event.type === 'budget/sample') {
+    const values = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'].map(key => data.usage?.[key])
+    if (values.some(value => !Number.isSafeInteger(value) || value < 0)
+      || !Number.isSafeInteger(values.reduce((a, b) => a + b, 0))) {
+      throw new Error('invalid legacy budget usage')
+    }
     return {
       type: 'sample',
       version: EVENT_VERSION,
@@ -197,6 +213,7 @@ async function validateSession(header, events) {
 }
 
 function stripBudgetEvents(header, events) {
+  if (events.some((event, index) => event.seq !== index)) throw new Error('invalid event sequence')
   const removedSeqs = new Set()
   const ledgerLines = []
   let scopeKey
@@ -255,6 +272,15 @@ function stripBudgetEvents(header, events) {
 
 export async function migrateSessionLog(homeOverride) {
   const home = dshHome(homeOverride)
+  const release = acquireStorageLock(join(home, 'agent-budget'))
+  try {
+    return await migrateUnlocked(home)
+  } finally {
+    release()
+  }
+}
+
+async function migrateUnlocked(home) {
   const sessionsRoot = join(home, 'sessions')
   const budgetDir = join(home, 'agent-budget')
   const ledgerPath = join(budgetDir, 'ledger.jsonl')
@@ -262,9 +288,30 @@ export async function migrateSessionLog(homeOverride) {
 
   mkdirSync(budgetDir, { recursive: true })
 
-  const scopeIndex = {}
+  const scopeIndex = Object.create(null)
   if (existsSync(indexPath)) {
-    Object.assign(scopeIndex, JSON.parse(readFileSync(indexPath, 'utf8')))
+    const parsed = JSON.parse(readFileSync(indexPath, 'utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.entries(parsed).some(([key, value]) => !key || typeof value !== 'string' || !value)) {
+      throw new Error('invalid scope index; repair before migrating')
+    }
+    Object.assign(scopeIndex, parsed)
+  }
+
+  // An interrupted migration may already have appended its budget records.
+  // Exact-record deduplication makes retry safe, including cumulative samples.
+  const recorded = new Set()
+  const openedScopes = new Set()
+  if (existsSync(ledgerPath)) {
+    const content = readFileSync(ledgerPath, 'utf8')
+    for (const raw of content.split(/\r?\n/).filter(Boolean)) {
+      const line = JSON.parse(raw)
+      if (!line || typeof line !== 'object' || line.version !== EVENT_VERSION
+        || typeof line.scopeKey !== 'string' || !line.scopeKey) throw new Error('invalid existing ledger')
+      if (line.type === 'open') openedScopes.add(line.scopeKey)
+      recorded.add(JSON.stringify(line))
+    }
+    if (content && !content.endsWith('\n')) appendFileSync(ledgerPath, '\n', { flush: true })
   }
 
   const files = walkSessions(sessionsRoot)
@@ -288,6 +335,7 @@ export async function migrateSessionLog(homeOverride) {
       let parsed
       try {
         parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid event')
       } catch {
         console.warn(`skip ${relative(home, file)}: malformed JSON line`)
         skipped += 1
@@ -316,6 +364,11 @@ export async function migrateSessionLog(homeOverride) {
 
     try {
       await validateSession(result.newHeader, result.filtered)
+      const available = new Set(openedScopes)
+      for (const line of result.ledgerLines) {
+        if (line.type === 'open') available.add(line.scopeKey)
+        else if (!available.has(line.scopeKey)) throw new Error('budget sample has no preceding open; migrate its root first')
+      }
     } catch (error) {
       console.warn(`skip ${relative(home, file)}: ${error.message}`)
       skipped += 1
@@ -323,24 +376,25 @@ export async function migrateSessionLog(homeOverride) {
     }
 
     const backup = backupPath(file)
-    copyFileSync(file, backup)
+    copyFileSync(file, backup, fsConstants.COPYFILE_EXCL)
+
+    for (const line of result.ledgerLines) {
+      const serialized = JSON.stringify(line)
+      if (recorded.has(serialized)) continue
+      appendFileSync(ledgerPath, `${serialized}\n`, { encoding: 'utf8', mode: 0o600, flush: true })
+      recorded.add(serialized)
+      if (line.type === 'open') openedScopes.add(line.scopeKey)
+    }
+    scopeIndex[header.id] = result.scopeKey
+    writeAtomic(indexPath, `${JSON.stringify(scopeIndex, null, 2)}\n`)
     writeSessionLines(
       file,
       [JSON.stringify(result.newHeader), ...result.filtered.map(event => JSON.stringify(event))],
     )
-
-    for (const line of result.ledgerLines) {
-      appendFileSync(ledgerPath, `${JSON.stringify(line)}\n`, 'utf8')
-    }
-    scopeIndex[header.id] = result.scopeKey
     const fileRemoved = events.filter(event => BUDGET_TYPES.has(event.type)).length
     migratedFiles += 1
     removedEvents += fileRemoved
     console.log(`migrated ${relative(home, file)} (${fileRemoved} events -> ${backup})`)
-  }
-
-  if (migratedFiles > 0) {
-    writeFileSync(indexPath, `${JSON.stringify(scopeIndex, null, 2)}\n`, 'utf8')
   }
 
   console.log(
@@ -355,13 +409,15 @@ async function main() {
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--dsh-home') {
       homeOverride = args[i + 1]
+      if (!homeOverride || homeOverride.startsWith('--')) throw new Error('--dsh-home requires a path')
       i += 1
     } else {
       console.error(`unknown argument: ${args[i]}`)
       process.exit(2)
     }
   }
-  await migrateSessionLog(homeOverride)
+  const result = await migrateSessionLog(homeOverride)
+  if (result.skipped > 0) process.exitCode = 1
 }
 
 if (process.argv[1] !== undefined

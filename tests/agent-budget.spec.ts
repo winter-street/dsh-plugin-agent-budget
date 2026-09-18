@@ -8,7 +8,7 @@ describe('plugin surface and config', () => {
     const module = await import('../src/index.ts')
     expect({ name, inject, Config: typeof Config, apply: typeof apply }).toEqual({
       name: 'agent-budget',
-      inject: ['llm', 'sessions', 'tools', 'agents', 'webServer'],
+      inject: ['llm', 'sessions', 'tools', 'agents'],
       Config: 'function',
       apply: 'function',
     })
@@ -210,6 +210,7 @@ describe('replay and lifecycle', () => {
     const first = firstHarness.root('durable')
     await firstHarness.stream(first, [usage({ inputTokens: 30, outputTokens: 5 }), finish()])
 
+    firstHarness.dispose()
     const secondHarness = new TestHarness({ maxTokens: 999, storageDir: firstHarness.storageDir })
     const resumed = secondHarness.resume(first)
     expect(await secondHarness.status(resumed)).toMatchObject({

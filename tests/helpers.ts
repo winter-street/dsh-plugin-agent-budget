@@ -1,6 +1,8 @@
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
+import { afterEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -29,6 +31,12 @@ type RequestErrorHandler = (
   next: () => Promise<unknown>,
 ) => Promise<unknown>
 
+const harnesses = new Set<TestHarness>()
+afterEach(() => {
+  for (const harness of harnesses) harness.dispose()
+  harnesses.clear()
+})
+
 export class TestHarness {
   readonly sessionsById = new Map<string, Session>()
   readonly streamHandlers: StreamHandler[] = []
@@ -36,11 +44,20 @@ export class TestHarness {
   readonly webServerRoutes: Array<{ kind: string; path: string; handler: (...args: any[]) => unknown }> = []
   readonly storageDir: string
   tool: ToolDefinition | undefined
+  readonly disposers: Array<() => unknown> = []
+  readonly webServer = {
+    register: (route: { kind: string; path: string; handler: (...args: any[]) => unknown }) => {
+      this.webServerRoutes.push(route)
+      return () => undefined
+    },
+  }
 
   readonly context = {
-    get: () => undefined,
+    inject: (_deps: string[], callback: (ctx: Context) => unknown) => callback(this.context),
+    get: (key: string) => key === 'webServer' ? this.webServer : undefined,
     effect: (callback: () => unknown) => {
       const result = callback()
+      if (typeof result === 'function') this.disposers.push(result as () => unknown)
       return typeof result === 'function' ? result : () => undefined
     },
     logger: loggerMock,
@@ -56,12 +73,6 @@ export class TestHarness {
         }
       },
     },
-    webServer: {
-      register: (route: { kind: string; path: string; handler: (...args: any[]) => unknown }) => {
-        this.webServerRoutes.push(route)
-        return () => undefined
-      },
-    },
     on: (name: string, handler: unknown) => {
       if (name === 'llm/stream') this.streamHandlers.push(handler as StreamHandler)
       if (name === 'agent/request-error') this.requestErrorHandlers.push(handler as RequestErrorHandler)
@@ -70,6 +81,7 @@ export class TestHarness {
   } as unknown as Context
 
   constructor(config: Config) {
+    harnesses.add(this)
     this.storageDir = config.storageDir ?? mkdtempSync(join(tmpdir(), 'agent-budget-test-'))
     apply(this.context, {
       maxTokens: config.maxTokens,
@@ -77,6 +89,10 @@ export class TestHarness {
       ...config.scope === undefined ? {} : { scope: config.scope },
       storageDir: this.storageDir,
     })
+  }
+
+  dispose(): void {
+    for (const dispose of this.disposers.splice(0).toReversed()) dispose()
   }
 
   add(session: Session): Session {
@@ -148,16 +164,23 @@ export class TestHarness {
     method: string,
     path: string,
     body?: unknown,
+    options: { headers?: Record<string, string>; remoteAddress?: string; rawBody?: string } = {},
   ): Promise<{ code: number; body: Record<string, unknown> }> {
     const route = this.webServerRoutes.find(item => item.path === '/agent-budget/api')
     if (route === undefined) throw new Error('agent-budget API route was not registered')
-    const req = {
+    const req = Object.assign(Readable.from(options.rawBody !== undefined
+      ? [Buffer.from(options.rawBody)]
+      : body !== undefined ? [Buffer.from(JSON.stringify(body))] : []), {
       method,
       url: `/agent-budget/api${path}`,
-      [Symbol.asyncIterator]: async function* (): AsyncGenerator<Buffer> {
-        if (body !== undefined) yield Buffer.from(JSON.stringify(body))
+      headers: {
+        host: 'localhost:3000',
+        'content-type': 'application/json',
+        'x-agent-budget-request': '1',
+        ...options.headers,
       },
-    }
+      socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' },
+    })
     return new Promise((resolve, reject) => {
       const res = {
         code: 200,

@@ -85,7 +85,7 @@ try {
   const packed = JSON.parse(report.slice(jsonStart))[0]
   if (!packed?.filename) throw new Error('npm pack did not report an archive')
   const names = new Set(packed.files.map(file => file.path))
-  for (const required of ['lib/index.js', 'lib/index.d.ts', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE']) {
+  for (const required of ['lib/index.js', 'lib/index.d.ts', 'lib/client.cjs', 'scripts/storage.mjs', 'scripts/migrate-session-log.mjs', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE']) {
     if (!names.has(required)) throw new Error(`packed artifact is missing ${required}`)
   }
   if (names.has('examples/cordis.patch.yml')) {

@@ -4,7 +4,7 @@ Shared token budgets for [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 agent trees. A root agent, its one-shot and continuable subagents, and workflow
 descendants can spend from one durable budget.
 
-> **Status**: experimental, verified against DSH `0.1.0-rc.5`. The package is
+> **Status**: experimental, verified against DSH `0.1.0-rc.6`. The package is
 > not published to npm yet; it is developed as an open-source contribution to
 > the DSH plugin ecosystem.
 
@@ -79,7 +79,7 @@ optional and defaults to `~/.dsh/agent-budget/`.
 The plugin exports four named members and **no default export**:
 
 - `name: 'agent-budget'`
-- `inject: ['llm', 'sessions', 'tools']`
+- `inject: ['llm', 'sessions', 'tools', 'agents']` (web server is optional)
 - `apply(ctx, config)` — the function-plugin entry point
 - `Config` — the loader-facing config schema
 
@@ -96,6 +96,11 @@ open budget scope, shows limit/used/remaining/exhausted state with a progress
 bar, and polls every 30 seconds.
 
 Host HTTP API under `/agent-budget/api`:
+
+The API is local-only. POST requests require `Content-Type: application/json`
+and `X-Agent-Budget-Request: 1`; bodies are limited to 16 KiB. Cross-origin
+requests are rejected. An active scope cannot be reset (HTTP 409).
+See [SECURITY.md](SECURITY.md) for access and recovery instructions.
 
 - `GET /scopes` → `{ ok, scopes: [{ scopeKey, limitTokens, usedTokens, ... }] }`
 - `POST /adjust-limit` with `{ scopeKey, limitTokens }` → overwrites the scope's
@@ -131,8 +136,9 @@ The plugin stores its ledger in:
 
 ```text
 ~/.dsh/agent-budget/
-  ledger.jsonl         append-only ledger (open/sample/unmetered)
+  ledger.jsonl         append-only ledger (including start/end call boundaries)
   scope-index.json     sessionId -> scopeKey index
+  writer.lock          exclusive writer lease
 ```
 
 - New versions **never write `budget/*` events into session logs**.
@@ -141,6 +147,11 @@ The plugin stores its ledger in:
 - One `storageDir` is intended for one DSH process at a time. If `headless`
   and `web` run concurrently, give each profile a distinct `storageDir` or do
   not run them against the same ledger simultaneously.
+- Concurrent writers are now rejected by a lock. Corrupt ledgers or indexes
+  stop startup. Back up the sidecar before upgrading; do not downgrade data
+  written by 0.3.0. See [SECURITY.md](SECURITY.md) for stale-lock recovery.
+- Calls interrupted by cancellation, stream failure, or process crashes are
+  marked unmetered if final usage is unknown, blocking dispatch by default.
 
 ## Migrating legacy session logs
 
@@ -163,14 +174,12 @@ Stop DSH processes that use the affected profile before running it.
 
 ## Known Limitations
 
-- The `agent/request-error` handler matches `failure.code === 'TOKEN_BUDGET_EXHAUSTED'`
-  globally and swallows any error carrying that code. Today only this plugin
-  produces it; if another plugin ever reuses the code, this boundary needs to
-  be tightened.
+- The error handler only suppresses budget errors for sessions actually
+  denied by this plugin. Error codes should still remain unique to producers.
 - `scope: tree` may fall back to an independent budget in extreme cold-start
   cases when no parent can be resolved. This prefers under-sharing over
   incorrectly locking unrelated chats together.
-- Verified against DSH `0.1.0-rc.5`. When upgrading DSH, re-check: the
+- Verified against DSH `0.1.0-rc.6`. When upgrading DSH, re-check: the
   `llm/stream` hook signature, the `agent/request-error` payload shape, and the
   `ctx.agents` runtime ownership API.
 - Concurrent admission can overshoot the limit by design (see Semantics).

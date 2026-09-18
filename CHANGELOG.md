@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.0] - 2026-09-18
+
+### Security
+
+- Restrict administration to loopback peers and local Host headers; reject
+  cross-origin requests and require an explicit header for JSON mutations.
+- Limit API bodies to 16 KiB and prevent internal error disclosure.
+- Reject corrupt ledgers/indexes and invalid or overflowing token usage.
+- Hold an exclusive writer lock shared by runtime and migration; persist
+  call boundaries so interrupted processes cannot silently forget usage.
+- Update Vitest and vulnerable transitive development dependencies.
+
+### Fixed
+
+- Meter cancelled and failed streams, including invalid usage after a sample.
+- Reject reset while calls are active and recheck admission on delayed iteration.
+- Keep the writer lock until active calls finish after plugin disposal.
+- Persist migration output before removing legacy events, replace files
+  atomically, validate legacy events, and deduplicate retries.
+- Load in headless compositions through optional web-server injection.
+- Preserve settings action errors, synchronize limits, validate inputs,
+  guard stale refreshes, and confirm resets.
+- Verify the client bundle in package checks and use a frozen lockfile in CI.
+
+### Compatibility
+
+- DSH peer requirements now match the tested `0.1.0-rc.6` runtime.
+- New `start`/`end` ledger records require 0.3.0 or later. Back up the sidecar
+  before upgrading; do not downgrade a ledger written by 0.3.0.
+- The HTTP API is local-only. See SECURITY.md for access and recovery details.
+
 ## [0.2.0] - 2026-08-18
 
 ### Changed

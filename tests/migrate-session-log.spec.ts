@@ -9,12 +9,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { migrateSessionLog } from '../scripts/migrate-session-log.mjs'
+import * as storage from '../scripts/storage.mjs'
 
 const tempDirs: string[] = []
 
 afterEach(() => {
+  vi.restoreAllMocks()
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -85,6 +87,51 @@ function framesText(buffer: Buffer): string[] {
 }
 
 describe('migrate-session-log', () => {
+  it('keeps the source intact on a storage failure and deduplicates a retry', async () => {
+    const home = tempHome()
+    const dir = join(home, 'sessions', 'project')
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'session.jsonl')
+    const original = [
+      { type: 'session', version: 0, id: 'retry', createdAt: 1 },
+      { type: 'budget/open', seq: 0, time: 1, data: { version: 1, rootSessionId: 'retry', epochId: 'e', limitTokens: 100 } },
+    ].map(value => JSON.stringify(value)).join('\n') + '\n'
+    writeFileSync(file, original)
+    const write = storage.writeAtomic
+    const spy = vi.spyOn(storage, 'writeAtomic').mockImplementation((path, content) => {
+      if (path.endsWith('scope-index.json')) throw new Error('simulated disk failure')
+      write(path, content)
+    })
+    await expect(migrateSessionLog(home)).rejects.toThrow('simulated disk failure')
+    expect(readFileSync(file, 'utf8')).toBe(original)
+    expect(readFileSync(`${file}.bak`, 'utf8')).toBe(original)
+    spy.mockRestore()
+    expect(await migrateSessionLog(home)).toMatchObject({ migratedFiles: 1, removedEvents: 1 })
+    expect(readFileSync(join(home, 'agent-budget', 'ledger.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1)
+    expect(await migrateSessionLog(home)).toMatchObject({ migratedFiles: 0 })
+  })
+
+  it('refuses migration while another writer owns the store', async () => {
+    const home = tempHome()
+    const release = storage.acquireStorageLock(join(home, 'agent-budget'))
+    try { await expect(migrateSessionLog(home)).rejects.toThrow('storage is locked') } finally { release() }
+  })
+
+  it('leaves malformed legacy events untouched', async () => {
+    const home = tempHome()
+    const dir = join(home, 'sessions', 'project')
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'session.jsonl')
+    const original = [
+      { type: 'session', version: 0, id: 'invalid', createdAt: 1 },
+      { type: 'budget/open', seq: 0, time: 1, data: { version: 1, rootSessionId: 'invalid', epochId: 'e', limitTokens: -1 } },
+    ].map(value => JSON.stringify(value)).join('\n') + '\n'
+    writeFileSync(file, original)
+    expect(await migrateSessionLog(home)).toMatchObject({ migratedFiles: 0, skipped: 1 })
+    expect(readFileSync(file, 'utf8')).toBe(original)
+    expect(existsSync(join(home, 'agent-budget', 'ledger.jsonl'))).toBe(false)
+  })
+
   it('migrates a multi-frame zstd session and preserves header/event frame layout', async () => {
     const home = tempHome()
     const sessionDir = join(home, 'sessions', 'project')

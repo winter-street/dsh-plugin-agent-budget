@@ -106,6 +106,32 @@ than a mutable counter.
   fail closed. Set `missingUsage: 'ignore'` only when a provider intentionally
   omits usage and incomplete enforcement is acceptable.
 
+## Control layer
+
+Accounting stays fail-closed; the optional control layer slows consumption
+before the hard limit is hit. None of these knobs write to the ledger, so the
+fold and replay semantics above are unchanged.
+
+- `degradeRatio` / `degradeModel` / `maxOutputTokens`: the `agent/request`
+  waterfall yields the frozen `LlmCallConfig`; returning a replacement switches
+  the model or tightens `maxTokens`. The `llm/stream` hook cannot do this —
+  loop requests are deep-frozen and mutation throws. Degradation activates when
+  the scope's remaining ratio drops below `degradeRatio`; `maxTokens` is
+  clamped to `min(current, maxOutputTokens, remainingTokens)` with a floor of
+  1. An unchanged configuration returns the original object so the loop does
+  not log a spurious header snapshot.
+- `maxConcurrentCalls`: admission rejects calls beyond the cap with
+  `TOKEN_BUDGET_CONCURRENT_LIMIT`, both at hook time and again at iteration
+  time, since several hooks can pass admission before any starts iterating.
+  This error is deliberately not suppressed by `agent/request-error`: callers
+  see a clear, retryable failure instead of a silent drop. The cap bounds the
+  concurrent-admission overshoot noted above.
+- `pressurePrompt` (default on): a dynamic `systemPrompt.context` provider,
+  evaluated at each assembly, adds a thrift notice at ≥50% usage and a
+  critical notice at ≥80%. Empty text contributes nothing, so quiet budgets
+  cost zero prompt tokens. The service is an optional peer; compositions
+  without `dsh-system-prompt` load unchanged.
+
 ## Tool surface
 
 The plugin registers one read-only tool:
@@ -145,7 +171,8 @@ numeric limits, synchronizes server updates, and ignores stale fetch results.
 - One `storageDir` supports one DSH process at a time. Concurrent `headless`
   and `web` processes must use distinct `storageDir` values or serialize access
   to the ledger.
-- Concurrent admission can overshoot the limit by design.
+- Concurrent admission can overshoot the limit by design; `maxConcurrentCalls`
+  bounds it when configured.
 - Metering is fail-closed by default.
 - Verified against DSH `0.1.0-rc.6`; when upgrading DSH, re-check the
   `llm/stream` hook signature, the `agent/request-error` payload shape, and the

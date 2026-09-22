@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0] - 2026-09-22
+
+### Added
+
+- Optional control layer: `degradeRatio`/`degradeModel`/`maxOutputTokens`
+  degrade near-exhaustion requests through the `agent/request` waterfall
+  (clamped `maxTokens`, cheaper model) instead of only rejecting at the limit.
+- `maxConcurrentCalls` caps simultaneous provider calls per scope; excess
+  calls fail before dispatch with `TOKEN_BUDGET_CONCURRENT_LIMIT`, bounding
+  the documented concurrent-admission overshoot.
+- Budget-pressure system-prompt context at 50%/80% usage (disable with
+  `pressurePrompt: false`), contributed through the optional
+  `@deepseek-ai/dsh-system-prompt` peer.
+
+### Compatibility
+
+- No ledger format changes: 0.3.0 ledgers load unchanged, no new record types
+  are written, and downgrading to 0.3.0 remains safe.
+
 ## [0.3.0] - 2026-09-18
 
 ### Security

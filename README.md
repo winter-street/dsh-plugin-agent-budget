@@ -74,6 +74,29 @@ omits usage and you accept incomplete enforcement. `scope` defaults to `tree`;
 set it to `session` for one independent budget per session. `storageDir` is
 optional and defaults to `~/.dsh/agent-budget/`.
 
+## Control layer (optional)
+
+Beyond accounting, the plugin can actively slow consumption as a scope nears
+its limit. Every knob is opt-in except the pressure prompt:
+
+- `degradeRatio` (0–1): when a scope's remaining ratio drops below this
+  threshold, each further `agent/request` is degraded — `maxTokens` is clamped
+  to the remaining budget (floor 1) and, when `degradeModel` is set, the model
+  is swapped for a cheaper one. `maxOutputTokens` adds a hard output cap while
+  degraded.
+- `maxConcurrentCalls`: caps simultaneous provider calls per scope; excess
+  calls fail before dispatch with `TOKEN_BUDGET_CONCURRENT_LIMIT`. This also
+  bounds the concurrent-admission overshoot described in Semantics.
+- `pressurePrompt` (default `true`): injects a budget-pressure notice into the
+  system prompt once usage passes 50%, escalating at 80%, so the model
+  self-throttles before hitting the hard limit. It rides the optional
+  `@deepseek-ai/dsh-system-prompt` peer; compositions without it load
+  unchanged.
+
+Degradation uses the `agent/request` waterfall because `llm/stream` requests
+are deep-frozen by the loop and cannot be rewritten there. Controls never
+write to the ledger: accounting semantics are unchanged.
+
 ## Export shape
 
 The plugin exports four named members and **no default export**:
@@ -182,7 +205,8 @@ Stop DSH processes that use the affected profile before running it.
 - Verified against DSH `0.1.0-rc.6`. When upgrading DSH, re-check: the
   `llm/stream` hook signature, the `agent/request-error` payload shape, and the
   `ctx.agents` runtime ownership API.
-- Concurrent admission can overshoot the limit by design (see Semantics).
+- Concurrent admission can overshoot the limit by design (see Semantics); set
+  `maxConcurrentCalls` to bound it.
 - Metering is fail-closed by default: providers that intentionally omit usage
   need `missingUsage: 'ignore'`.
 

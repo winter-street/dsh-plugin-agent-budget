@@ -7,8 +7,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { HarnessError } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { HarnessError, callConfigEquals } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { authorizeRequest, HttpError, readJsonBody, sendJson } from './http.ts'
@@ -26,12 +26,28 @@ function isWebServer(value: unknown): value is BudgetWebServer {
   return isRecord(value) && typeof value.register === 'function'
 }
 
+interface BudgetSystemPrompt {
+  context(entry: {
+    name: string
+    order: number
+    text: string | ((assembleCtx: { agent?: { session: { id: unknown } } }) => string)
+  }): () => void
+}
+
+function isSystemPrompt(value: unknown): value is BudgetSystemPrompt {
+  return isRecord(value) && typeof value.context === 'function'
+}
+
 export const name = 'agent-budget'
 export const inject = ['llm', 'sessions', 'tools', 'agents']
 
 const EVENT_VERSION = 1 as const
 const EXHAUSTED_CODE = 'TOKEN_BUDGET_EXHAUSTED'
+const CONCURRENT_LIMIT_CODE = 'TOKEN_BUDGET_CONCURRENT_LIMIT'
 const EVENT_TYPES = ['budget/open', 'budget/sample', 'budget/unmetered'] as const
+const PRESSURE_WARN_RATIO = 0.5
+const PRESSURE_CRITICAL_RATIO = 0.8
+const PRESSURE_CONTEXT_ORDER = 900
 
 type MissingUsagePolicy = 'exhaust' | 'ignore'
 type ScopeMode = 'session' | 'tree'
@@ -91,6 +107,16 @@ export interface Config {
   missingUsage?: MissingUsagePolicy
   scope?: ScopeMode
   storageDir?: string
+  /** Remaining-ratio threshold below which requests are degraded. Must be in (0, 1). */
+  degradeRatio?: number
+  /** Cheaper model substituted while degraded. Without it only maxTokens is tightened. */
+  degradeModel?: string
+  /** Hard maxTokens cap applied while degraded. */
+  maxOutputTokens?: number
+  /** Maximum simultaneous provider calls admitted per budget scope. */
+  maxConcurrentCalls?: number
+  /** Inject budget-pressure context into system prompts. Defaults to true. */
+  pressurePrompt?: boolean
 }
 
 /** Loader-facing schema; runtime validation also protects direct plugin calls. */
@@ -99,6 +125,11 @@ export const Config: z<Config> = z.object({
   missingUsage: z.union(['exhaust', 'ignore'] as const).default('exhaust'),
   scope: z.union(['session', 'tree'] as const).default('tree'),
   storageDir: z.string(),
+  degradeRatio: z.number(),
+  degradeModel: z.string(),
+  maxOutputTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+  maxConcurrentCalls: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+  pressurePrompt: z.boolean().default(true),
 })
 
 /** One append-only ledger line in the plugin-owned sidecar store. */
@@ -196,21 +227,48 @@ class TokenBudgetExhaustedError extends HarnessError {
   }
 }
 
+class TokenBudgetConcurrentLimitError extends HarnessError {
+  constructor(scopeKey: string, limit: number) {
+    super(
+      `token budget concurrent call limit reached (scope=${scopeKey}, limit=${limit})`,
+      CONCURRENT_LIMIT_CODE,
+    )
+  }
+}
+
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   return join(home, 'agent-budget')
+}
+
+/** Validated control-layer knobs derived from {@link Config}. */
+interface ControlConfig {
+  degradeRatio: number | undefined
+  degradeModel: string | undefined
+  maxOutputTokens: number | undefined
+  maxConcurrentCalls: number | undefined
+  pressurePrompt: boolean
 }
 
 function validateConfig(config: Config): {
   missingUsage: MissingUsagePolicy
   scope: ScopeMode
   storageDir: string
+  control: ControlConfig
 } {
+  const knownKeys = new Set([
+    'maxTokens',
+    'missingUsage',
+    'scope',
+    'storageDir',
+    'degradeRatio',
+    'degradeModel',
+    'maxOutputTokens',
+    'maxConcurrentCalls',
+    'pressurePrompt',
+  ])
   for (const key of Object.keys(config)) {
-    if (key !== 'maxTokens'
-      && key !== 'missingUsage'
-      && key !== 'scope'
-      && key !== 'storageDir') {
+    if (!knownKeys.has(key)) {
       throw new TypeError(`agent-budget: unknown config key ${JSON.stringify(key)}`)
     }
   }
@@ -229,7 +287,34 @@ function validateConfig(config: Config): {
   if (typeof storageDir !== 'string' || storageDir.trim().length === 0 || storageDir.includes('\0')) {
     throw new TypeError('agent-budget: storageDir must be a non-empty path')
   }
-  return { missingUsage, scope, storageDir }
+  const degradeRatio = config.degradeRatio
+  if (degradeRatio !== undefined
+    && (typeof degradeRatio !== 'number' || !Number.isFinite(degradeRatio)
+      || degradeRatio <= 0 || degradeRatio >= 1)) {
+    throw new TypeError('agent-budget: degradeRatio must be a number in the open interval (0, 1)')
+  }
+  const degradeModel = config.degradeModel
+  if (degradeModel !== undefined && !nonEmptyString(degradeModel)) {
+    throw new TypeError('agent-budget: degradeModel must be a non-empty string')
+  }
+  const maxOutputTokens = config.maxOutputTokens
+  if (maxOutputTokens !== undefined && (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1)) {
+    throw new TypeError('agent-budget: maxOutputTokens must be a positive safe integer')
+  }
+  const maxConcurrentCalls = config.maxConcurrentCalls
+  if (maxConcurrentCalls !== undefined && (!Number.isSafeInteger(maxConcurrentCalls) || maxConcurrentCalls < 1)) {
+    throw new TypeError('agent-budget: maxConcurrentCalls must be a positive safe integer')
+  }
+  const pressurePrompt = config.pressurePrompt ?? true
+  if (typeof pressurePrompt !== 'boolean') {
+    throw new TypeError('agent-budget: pressurePrompt must be a boolean')
+  }
+  return {
+    missingUsage,
+    scope,
+    storageDir,
+    control: { degradeRatio, degradeModel, maxOutputTokens, maxConcurrentCalls, pressurePrompt },
+  }
 }
 
 function emptyState(): LedgerState {
@@ -563,10 +648,10 @@ class LedgerStore {
   }
 }
 
-function denial(budget: BudgetStatus): AsyncIterable<StreamChunk> {
+function denial(error: HarnessError): AsyncIterable<StreamChunk> {
   return (async function* (): AsyncGenerator<StreamChunk> {
-    if (budget.exhausted) throw new TokenBudgetExhaustedError(budget)
     yield* []
+    throw error
   })()
 }
 
@@ -712,13 +797,46 @@ function budgetStatus(
   }
 }
 
+/**
+ * Tighten one frozen call configuration while the scope's remaining ratio is
+ * below `control.degradeRatio`. Returns the original object when nothing
+ * changes so the loop does not log a spurious header snapshot.
+ */
+function degradeConfig(cfg: LlmCallConfig, status: BudgetStatus, control: ControlConfig): LlmCallConfig {
+  if (control.degradeRatio === undefined || status.limitTokens < 1) return cfg
+  if (status.remainingTokens / status.limitTokens >= control.degradeRatio) return cfg
+  const maxTokens = Math.max(1, Math.min(
+    cfg.maxTokens ?? Number.MAX_SAFE_INTEGER,
+    control.maxOutputTokens ?? Number.MAX_SAFE_INTEGER,
+    status.remainingTokens,
+  ))
+  const next: LlmCallConfig = { ...cfg, maxTokens, model: control.degradeModel ?? cfg.model }
+  return callConfigEquals(cfg, next) ? cfg : next
+}
+
+/** Budget-pressure prompt text for one scope; empty below the warn threshold. */
+function pressureText(status: BudgetStatus): string {
+  if (status.limitTokens < 1) return ''
+  const usedRatio = status.usedTokens / status.limitTokens
+  if (status.exhausted || usedRatio >= PRESSURE_CRITICAL_RATIO) {
+    return `Token budget critical: ${status.usedTokens}/${status.limitTokens} tokens used. `
+      + 'Answer directly with what you have; do not spawn subagents; '
+      + 'avoid non-essential tool calls and lengthy explanations.'
+  }
+  if (usedRatio >= PRESSURE_WARN_RATIO) {
+    return `Token budget notice: ${status.usedTokens}/${status.limitTokens} tokens used. `
+      + 'Prefer concise answers and avoid unnecessary subagents or tool calls.'
+  }
+  return ''
+}
+
 function scopesOf(store: LedgerStore): string[] {
   return [...store.states.keys()].filter(scopeKey => store.state(scopeKey).open !== undefined)
 }
 
 /** Register the shared budget gate, sidecar ledger, and read-only status tool. */
 export function apply(ctx: Context, config: Config): void {
-  const { missingUsage, scope, storageDir } = validateConfig(config)
+  const { missingUsage, scope, storageDir, control } = validateConfig(config)
   const logger = ctx.logger('agent-budget')
   const store = new LedgerStore(storageDir)
   let disposed = false
@@ -786,7 +904,16 @@ export function apply(ctx: Context, config: Config): void {
         before.usedTokens,
         before.unmeteredCalls,
       )
-      return denial(before)
+      return denial(new TokenBudgetExhaustedError(before))
+    }
+    if (control.maxConcurrentCalls !== undefined
+      && (activeCalls.get(scopeKey) ?? 0) >= control.maxConcurrentCalls) {
+      logger.warn(
+        'concurrent call limit reached before provider dispatch: scope=%s limit=%d',
+        scopeKey,
+        control.maxConcurrentCalls,
+      )
+      return denial(new TokenBudgetConcurrentLimitError(scopeKey, control.maxConcurrentCalls))
     }
     deniedSessions.delete(sessionId)
 
@@ -817,6 +944,12 @@ export function apply(ctx: Context, config: Config): void {
       if (admission.exhausted) {
         deniedSessions.add(sessionId)
         throw new TokenBudgetExhaustedError(admission)
+      }
+      // Recheck the concurrency cap at iteration time: several hooks may have
+      // passed the admission check before any of them started iterating.
+      if (control.maxConcurrentCalls !== undefined
+        && (activeCalls.get(scopeKey) ?? 0) >= control.maxConcurrentCalls) {
+        throw new TokenBudgetConcurrentLimitError(scopeKey, control.maxConcurrentCalls)
       }
       store.appendCallBoundary(scopeKey, callId, 'start')
       store.activeCallIds.add(callId)
@@ -884,6 +1017,48 @@ export function apply(ctx: Context, config: Config): void {
     }
     return next()
   })
+
+  // Degrade near-exhaustion requests through the agent/request waterfall: the
+  // llm/stream hook receives a deep-frozen request and can only observe or
+  // reject, so maxTokens/model tightening must happen here instead.
+  if (control.degradeRatio !== undefined) {
+    ctx.on('agent/request', async (payload, next) => {
+      const cfg = await next()
+      if (disposed) return cfg
+      const sessionId = String(payload.agent.session.id)
+      const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger, ownershipCache)
+      const degraded = degradeConfig(cfg, createStatus(scopeKey, false), control)
+      if (degraded !== cfg) {
+        logger.info(
+          'degraded llm call config: scope=%s model=%s->%s maxTokens=%s->%d',
+          scopeKey,
+          cfg.model,
+          degraded.model,
+          String(cfg.maxTokens),
+          degraded.maxTokens,
+        )
+      }
+      return degraded
+    })
+  }
+
+  if (control.pressurePrompt) {
+    ctx.inject(['systemPrompt'], (promptCtx) => {
+      const systemPrompt: unknown = promptCtx.get('systemPrompt')
+      if (!isSystemPrompt(systemPrompt)) throw new Error('agent-budget: incompatible system prompt service')
+      promptCtx.effect(() => systemPrompt.context({
+        name: 'agent-budget:pressure',
+        order: PRESSURE_CONTEXT_ORDER,
+        text: (assembleCtx) => {
+          const agent = assembleCtx.agent
+          if (agent === undefined || disposed) return ''
+          const sessionId = String(agent.session.id)
+          const scopeKey = resolveScopeKey(ctx, store, sessionId, scope, logger, ownershipCache)
+          return pressureText(createStatus(scopeKey, false))
+        },
+      }), 'agent-budget: pressure-context')
+    })
+  }
 
   ctx.tools.register(defineTool({
     name: 'budget_status',

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
@@ -31,6 +31,17 @@ type RequestErrorHandler = (
   next: () => Promise<unknown>,
 ) => Promise<unknown>
 
+export type RequestHandler = (
+  payload: { agent: { session: Session } },
+  next: () => Promise<LlmCallConfig>,
+) => Promise<LlmCallConfig>
+
+export interface PromptContextEntry {
+  name: string
+  order: number
+  text: string | ((assembleCtx: unknown) => string)
+}
+
 const harnesses = new Set<TestHarness>()
 afterEach(() => {
   for (const harness of harnesses) harness.dispose()
@@ -41,6 +52,8 @@ export class TestHarness {
   readonly sessionsById = new Map<string, Session>()
   readonly streamHandlers: StreamHandler[] = []
   readonly requestErrorHandlers: RequestErrorHandler[] = []
+  readonly requestHandlers: RequestHandler[] = []
+  readonly promptContexts: PromptContextEntry[] = []
   readonly webServerRoutes: Array<{ kind: string; path: string; handler: (...args: any[]) => unknown }> = []
   readonly storageDir: string
   tool: ToolDefinition | undefined
@@ -51,10 +64,16 @@ export class TestHarness {
       return () => undefined
     },
   }
+  readonly systemPrompt = {
+    context: (entry: PromptContextEntry) => {
+      this.promptContexts.push(entry)
+      return () => undefined
+    },
+  }
 
   readonly context = {
     inject: (_deps: string[], callback: (ctx: Context) => unknown) => callback(this.context),
-    get: (key: string) => key === 'webServer' ? this.webServer : undefined,
+    get: (key: string) => key === 'webServer' ? this.webServer : key === 'systemPrompt' ? this.systemPrompt : undefined,
     effect: (callback: () => unknown) => {
       const result = callback()
       if (typeof result === 'function') this.disposers.push(result as () => unknown)
@@ -76,6 +95,7 @@ export class TestHarness {
     on: (name: string, handler: unknown) => {
       if (name === 'llm/stream') this.streamHandlers.push(handler as StreamHandler)
       if (name === 'agent/request-error') this.requestErrorHandlers.push(handler as RequestErrorHandler)
+      if (name === 'agent/request') this.requestHandlers.push(handler as RequestHandler)
       return () => undefined
     },
   } as unknown as Context
@@ -83,12 +103,7 @@ export class TestHarness {
   constructor(config: Config) {
     harnesses.add(this)
     this.storageDir = config.storageDir ?? mkdtempSync(join(tmpdir(), 'agent-budget-test-'))
-    apply(this.context, {
-      maxTokens: config.maxTokens,
-      ...config.missingUsage === undefined ? {} : { missingUsage: config.missingUsage },
-      ...config.scope === undefined ? {} : { scope: config.scope },
-      storageDir: this.storageDir,
-    })
+    apply(this.context, Object.assign({}, config, { storageDir: this.storageDir }))
   }
 
   dispose(): void {
@@ -149,6 +164,23 @@ export class TestHarness {
       agent: { session },
     } as never)
     return value as Record<string, unknown>
+  }
+
+  lastRequestBase: LlmCallConfig | undefined
+
+  async request(session: Session, cfg: Partial<LlmCallConfig> = {}): Promise<LlmCallConfig> {
+    const handler = this.requestHandlers[0]
+    if (handler === undefined) throw new Error('agent/request handler was not registered')
+    const base: LlmCallConfig = { provider: 'mock', model: 'mock-model', ...cfg }
+    this.lastRequestBase = base
+    return handler({ agent: { session } }, () => Promise.resolve(base))
+  }
+
+  pressureTextFor(session?: Session): string {
+    const entry = this.promptContexts.find(item => item.name === 'agent-budget:pressure')
+    if (entry === undefined) throw new Error('pressure context was not registered')
+    if (typeof entry.text !== 'function') return entry.text
+    return entry.text(session === undefined ? {} : { agent: { session } })
   }
 
   ledgerLines(): Record<string, unknown>[] {

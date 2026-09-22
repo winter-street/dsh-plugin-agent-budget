@@ -5,3 +5,9 @@
         maxTokens: 200000
         missingUsage: exhaust
         scope: tree
+        # Control layer (all optional; see README "Control layer"):
+        # degradeRatio: 0.2        # tighten requests once <20% of the budget remains
+        # degradeModel: deepseek-chat
+        # maxOutputTokens: 4096
+        # maxConcurrentCalls: 4
+        # pressurePrompt: true     # default

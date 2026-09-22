@@ -64,6 +64,23 @@ allowBuilds:
 `scope` 默认为 `tree`；`session` 会让每个 Session 独立计费。
 `storageDir` 可选，默认是 `~/.dsh/agent-budget/`。
 
+## 控制层（可选）
+
+在记账之外，插件可以在预算接近耗尽时主动压低消耗。除压力提示外均默认关闭：
+
+- `degradeRatio`（0~1）：当 scope 剩余预算占比低于该阈值，后续每个
+  `agent/request` 都会被降配——`maxTokens` 收紧到剩余预算（下限为 1）；配置了
+  `degradeModel` 时同时切换为更便宜的模型。`maxOutputTokens` 可在降配期间
+  限制输出硬上限。
+- `maxConcurrentCalls`：限制每个 scope 的并发调用数，超出的调用在派发前以
+  `TOKEN_BUDGET_CONCURRENT_LIMIT` 失败。这也收敛了"已知限制"中的并发超额。
+- `pressurePrompt`（默认 `true`）：用量超过 50% 后向系统提示注入预算压力提示，
+  80% 后升级为紧急措辞，让模型在撞到硬上限之前自律。依赖可选的
+  `@deepseek-ai/dsh-system-prompt` peer；没有该服务的组合照常加载，仅不注入提示。
+
+降配走 `agent/request` waterfall，因为 loop 发出的 `llm/stream` 请求被深冻结、
+不可在钩子里改写。控制层不写入账本，记账语义不变。
+
 ## 导出面（Export shape）
 
 插件导出四个命名成员，**没有默认导出**：
@@ -155,7 +172,8 @@ node scripts/migrate-session-log.mjs
 - `scope: tree` 在极端冷启动且 parent 不可解析时会退化为独立预算，宁可少共享，也不误锁。
 - 与 DSH `0.1.0-rc.6` 验证；升级 DSH 时请重点回归：`llm/stream` 钩子签名、
   `agent/request-error` 载荷结构、`ctx.agents` 的 runtime ownership API。
-- 并发准入可能造成有限超额，这是设计取舍（README 语义已声明）。
+- 并发准入可能造成有限超额，这是设计取舍（README 语义已声明）；配置
+  `maxConcurrentCalls` 可加以限制。
 - 计量不完整时默认 fail-closed：明确不返回 usage 的 provider 请配置
   `missingUsage: 'ignore'`。
 
